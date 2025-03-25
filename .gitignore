@@ -1,0 +1,7 @@
+# Virtual environment
+venv*/
+venv_tensorboard/
+
+# Large files
+*.dll
+*.pyd
