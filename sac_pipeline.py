@@ -26,7 +26,9 @@ def main():
 
     # Create save directory if needed
     if config["save_path"]:
-        os.makedirs(os.path.dirname(config["save_path"]), exist_ok=True)
+        save_dir = os.path.dirname(config["save_path"])
+        if save_dir:  # Only create directories if path contains a directory
+            os.makedirs(save_dir, exist_ok=True)
 
     try:
         # Train the model
@@ -34,7 +36,7 @@ def main():
             dataset_path=config["dataset_path"],
             epochs=config["epochs"],
             batch_size=config["batch_size"],
-            save_path=os.path.splitext(config["save_path"])[0]  # Remove extension for checkpoints
+            save_path=config["save_path"].replace('.pth', '')  # Remove extension for checkpoints
         )
 
         # Save final model
