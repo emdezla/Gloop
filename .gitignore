@@ -36,3 +36,4 @@ logs/
 *.egg
 build/
 dist/
+.aider*
