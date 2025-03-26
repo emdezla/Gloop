@@ -254,9 +254,11 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
     # Optimizers
     optimizer_actor = optim.Adam(model.actor.parameters(), lr=3e-4)
     optimizer_critic = optim.Adam(
-        list(model.q1.parameters()) + list(model.q2.parameters()), lr=3e-4
+        list(model.q1.parameters()) + list(model.q2.parameters()), 
+        lr=3e-4,
+        weight_decay=1e-4  # Added weight decay
     )
-    optimizer_alpha = optim.Adam([model.log_alpha], lr=1e-4)
+    optimizer_alpha = optim.Adam([model.log_alpha], lr=3e-5)  # Reduced from 1e-4
     target_entropy = -torch.tensor(action_dim).to(device)  # Target entropy = -action_dim
     
     # Logging
@@ -268,7 +270,8 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
         csv_writer = csv.writer(f)
         csv_writer.writerow(['Epoch', 'Iteration', 'TD Loss', 'CQL Penalty', 
                            'Critic Loss', 'Actor Loss', 'Q1 Value', 'Q2 Value',
-                           'Action_Mean', 'Action_Std', 'Entropy'])
+                           'Action_Mean', 'Action_Std', 'Entropy', 'Alpha', 'Alpha_Loss',
+                           'Q1_Grad', 'Q2_Grad', 'Actor_Grad'])
 
     # Training loop
     global_step = 0
@@ -298,14 +301,14 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
             current_q1 = model.q1(torch.cat([states, dataset_actions], 1))
             current_q2 = model.q2(torch.cat([states, dataset_actions], 1))
             
-            td_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
+            td_loss = F.smooth_l1_loss(current_q1, target_q) + F.smooth_l1_loss(current_q2, target_q)
             cql_penalty = compute_cql_penalty(states, dataset_actions, model)
             critic_loss = td_loss + cql_weight * cql_penalty
 
             optimizer_critic.zero_grad()
             critic_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.q1.parameters(), 1.0)
-            torch.nn.utils.clip_grad_norm_(model.q2.parameters(), 1.0)
+            q1_grad_norm = torch.nn.utils.clip_grad_norm_(model.q1.parameters(), 1.0).item()
+            q2_grad_norm = torch.nn.utils.clip_grad_norm_(model.q2.parameters(), 1.0).item()
             optimizer_critic.step()
 
             # --- Actor Update ---
@@ -329,13 +332,14 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
 
             optimizer_actor.zero_grad()
             actor_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.actor.parameters(), 0.5)
+            actor_grad_norm = torch.nn.utils.clip_grad_norm_(model.actor.parameters(), 0.5).item()
             optimizer_actor.step()
             
             # Alpha optimization
             alpha_loss = -(model.log_alpha * (entropy - target_entropy).detach()).mean()
             optimizer_alpha.zero_grad()
             alpha_loss.backward()
+            torch.nn.utils.clip_grad_norm_([model.log_alpha], 0.1)  # Added clipping
             optimizer_alpha.step()
 
             # --- Target Update ---
@@ -353,6 +357,9 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
             metrics['entropy'] += entropy.item()
             metrics['alpha'] = alpha.item()
             metrics['alpha_loss'] = alpha_loss.item()
+            metrics['q1_grad'] += q1_grad_norm
+            metrics['q2_grad'] += q2_grad_norm
+            metrics['actor_grad'] += actor_grad_norm
             batch_count += 1
             global_step += 1
 
@@ -373,7 +380,8 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
                         avg_metrics['critic'], avg_metrics['actor'],
                         avg_metrics['q1'], avg_metrics['q2'],
                         avg_metrics['action_mean'], avg_metrics['action_std'],
-                        avg_metrics['entropy'], avg_metrics['alpha'], avg_metrics['alpha_loss']
+                        avg_metrics['entropy'], avg_metrics['alpha'], avg_metrics['alpha_loss'],
+                        avg_metrics.get('q1_grad', 0), avg_metrics.get('q2_grad', 0), avg_metrics.get('actor_grad', 0)
                     ])
                 
                 metrics = defaultdict(float)

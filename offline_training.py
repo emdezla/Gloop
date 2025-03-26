@@ -6,10 +6,11 @@ if __name__ == "__main__":
         "dataset_path": "datasets/processed/563-train.csv",
         "csv_file": "training_stats.csv",
         "epochs": 60,
-        "batch_size": 256,
+        "batch_size": 512,  # Increased from 256
         "device": device,
-        "cql_weight": 0.25,
-        "alpha": 0.2
+        "cql_weight": 0.1,  # Reduced from 0.25
+        "alpha": 0.2,
+        "tau": 0.01  # Added target network update rate
     }
 
     # Initialize and train
@@ -22,7 +23,8 @@ if __name__ == "__main__":
         batch_size=config["batch_size"],
         device=config["device"],
         alpha=config["alpha"],
-        cql_weight=config["cql_weight"]
+        cql_weight=config["cql_weight"],
+        tau=config["tau"]
     )
     
     # Save final model
