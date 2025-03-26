@@ -19,6 +19,7 @@ __pycache__/
 *.csv
 *.data
 *.dat
+*.pth
 
 # Logs and outputs
 *.log
