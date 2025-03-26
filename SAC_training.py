@@ -214,15 +214,19 @@ class SACAgent:
     
     def save(self, path):
         """Save model to disk"""
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save({
-            'actor': self.actor.state_dict(),
-            'critic1': self.critic1.state_dict(),
-            'critic2': self.critic2.state_dict(),
-            'target_critic1': self.target_critic1.state_dict(),
-            'target_critic2': self.target_critic2.state_dict(),
-            'log_alpha': self.log_alpha,
-        }, path)
+        if path:  # Only save if path is provided
+            # Ensure directory exists before saving
+            save_dir = os.path.dirname(path)
+            if save_dir:  # Only create directories if path contains a directory
+                os.makedirs(save_dir, exist_ok=True)
+            torch.save({
+                'actor': self.actor.state_dict(),
+                'critic1': self.critic1.state_dict(),
+                'critic2': self.critic2.state_dict(),
+                'target_critic1': self.target_critic1.state_dict(),
+                'target_critic2': self.target_critic2.state_dict(),
+                'log_alpha': self.log_alpha,
+            }, path)
         
     def load(self, path):
         """Load model from disk"""
@@ -292,12 +296,14 @@ def train_sac_offline(dataset_path, epochs=1000, batch_size=256, save_path=None)
             print(f"  Alpha: {metrics['alpha'][-1]:.4f}")
             
             # Save checkpoint
-            if save_path:
-                agent.save(f"{save_path}_epoch{epoch+1}.pt")
+            if save_path and (epoch + 1) % 100 == 0:
+                checkpoint_path = f"{os.path.splitext(save_path)[0]}_epoch{epoch+1}.pt"
+                agent.save(checkpoint_path)
     
     # Save final model
     if save_path:
-        agent.save(f"{save_path}_final.pt")
+        final_path = f"{os.path.splitext(save_path)[0]}_final.pt"
+        agent.save(final_path)
         
     return agent
 

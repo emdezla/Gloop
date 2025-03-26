@@ -36,7 +36,7 @@ def main():
             dataset_path=config["dataset_path"],
             epochs=config["epochs"],
             batch_size=config["batch_size"],
-            save_path=config["save_path"].replace('.pth', '')  # Remove extension for checkpoints
+            save_path=config["save_path"]  # Keep original extension
         )
 
         # Save final model
