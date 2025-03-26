@@ -84,8 +84,7 @@ class SACCQL(nn.Module):
         self.action_scale = 1.0  # Adjust to your insulin range (e.g., 0-5 units)
         # Add entropy temperature parameter with higher initialization
         self.log_alpha = torch.nn.Parameter(torch.tensor([2.0], requires_grad=True))
-        # Add Q-value normalization layer
-        self.q_norm = nn.LayerNorm(512)
+        # Remove Q-value normalization layer for better gradient flow
 
         # Improved Stochastic Actor (Gaussian policy)
         self.actor = nn.Sequential(
@@ -113,16 +112,13 @@ class SACCQL(nn.Module):
         nn.init.uniform_(self.mean.weight, -0.1, 0.1)
         nn.init.constant_(self.log_std.weight, -1.0)  # Safer initialization
 
-        # Twin Critics with CQL
+        # Twin Critics with CQL - Revised architecture for better gradient flow
         def create_q():
             return nn.Sequential(
                 nn.Linear(10, 512),
-                nn.LayerNorm(512),
                 nn.SiLU(),  # Changed from ReLU
-                self.q_norm,  # Added Q-value normalization
                 nn.Linear(512, 512),  # Deeper network
-                nn.LayerNorm(512),
-                nn.SiLU(),  # Changed from ReLU
+                nn.LeakyReLU(0.1),  # Better gradient flow than SiLU
                 nn.Linear(512, 1)
             )
         
@@ -254,13 +250,13 @@ def compute_cql_penalty(states, dataset_actions, model, num_action_samples=10, g
     
     cql_penalty = (logsumexp_q1 + logsumexp_q2 - 2 * dataset_q_mean)
     
-    # Adaptive CQL weight based on Q-value spread
+    # Adaptive CQL weight based on Q-value spread - less aggressive scaling
     q_spread = torch.std(q1_all) + torch.std(q2_all)
-    adaptive_factor = 1.0 + torch.tanh(q_spread/5.0)
+    adaptive_factor = 1.0 + 0.5*torch.tanh(q_spread/3.0)
     
-    # New dynamic margin based on training progress
+    # New dynamic margin based on training progress - faster decay
     progress = min(global_step / (epochs * dataloader_len), 1.0)  # 0→1 scale
-    margin = 3.0 * (1 - 0.95*progress)  # Start at 3.0, decay to 0.15
+    margin = 2.0 * (1 - 0.98*progress)  # Start at 2.0, decay to 0.04
     
     # Add gradient regularization to prevent Q-value collapse
     q_penalty = torch.clamp(cql_penalty * adaptive_factor, min=-margin, max=margin)
@@ -351,7 +347,9 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
             cql_penalty = compute_cql_penalty(states, dataset_actions, model, global_step=global_step, 
                                              epochs=epochs, dataloader_len=len(dataloader))
             # Apply cql_weight here instead of in the compute_cql_penalty function
-            critic_loss = td_loss + cql_weight * cql_penalty
+            # Add gradient penalty to prevent Q-value collapse
+            grad_pen = 0.001 * (current_q1.pow(2).mean() + current_q2.pow(2).mean())
+            critic_loss = td_loss + cql_weight * cql_penalty + grad_pen
 
             optimizer_critic.zero_grad()
             critic_loss.backward()
@@ -376,7 +374,8 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
             
             log_probs = normal.log_prob(x_t).sum(1)
             log_probs -= torch.log(1 - y_t.pow(2) + 1e-6).sum(1)
-            entropy = torch.clamp(log_probs.mean(), min=-1.0, max=2.0)  # Tighter constraints to prevent entropy collapse
+            # Shift entropy to positive range to prevent entropy collapse
+            entropy = torch.clamp(log_probs.mean() + 2.0, min=0.1, max=2.0)
             
             # Add entropy regularization scaling
             entropy_scale = torch.clamp(1.0 / (entropy.detach() + 1e-6), 0.1, 10.0)
@@ -392,8 +391,9 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
             # Add policy smoothing penalty
             smooth_penalty = F.mse_loss(q1_pred, q1_smooth) + F.mse_loss(q2_pred, q2_smooth)
             
-            # Combine losses without advantage guidance to prevent conflicting optimization
-            actor_loss = -torch.min(q1_pred, q2_pred).mean() * 0.5 + alpha * entropy * entropy_scale + 0.1 * smooth_penalty
+            # Revised conservative actor loss to prevent over-optimization
+            q_min = torch.min(q1_pred, q2_pred)
+            actor_loss = -(q_min - 0.1 * q_min.std()).mean() + alpha * entropy + 0.1 * smooth_penalty
 
             optimizer_actor.zero_grad()
             actor_loss.backward()
