@@ -44,7 +44,7 @@ class DiabetesDataset(Dataset):
 
         # Compute rewards based on glu_raw at t+1
         glucose_next_tensor = torch.tensor(self.df["glu_raw"].values, dtype=torch.float32)
-        self.rewards = compute_reward_torch(glucose_next_tensor) / 15.0  # Normalize if needed
+        self.rewards = compute_reward_torch(glucose_next_tensor) / 5.0  # Reduced normalization factor from 15.0
 
         # Compute next_states using vectorized roll
         self.next_states = np.roll(self.states, shift=-1, axis=0)
@@ -84,6 +84,8 @@ class SACCQL(nn.Module):
         self.action_scale = 1.0  # Adjust to your insulin range (e.g., 0-5 units)
         # Add entropy temperature parameter with higher initialization
         self.log_alpha = torch.nn.Parameter(torch.tensor([2.0], requires_grad=True))
+        # Add Q-value normalization layer
+        self.q_norm = nn.LayerNorm(512)
 
         # Improved Stochastic Actor (Gaussian policy)
         self.actor = nn.Sequential(
@@ -117,6 +119,7 @@ class SACCQL(nn.Module):
                 nn.Linear(10, 512),
                 nn.LayerNorm(512),
                 nn.SiLU(),  # Changed from ReLU
+                self.q_norm,  # Added Q-value normalization
                 nn.Linear(512, 512),  # Deeper network
                 nn.LayerNorm(512),
                 nn.SiLU(),  # Changed from ReLU
@@ -208,7 +211,7 @@ def debug_tensor(tensor, name="", check_grad=False, threshold=1e6):
         if torch.isinf(grad).any():
             print(f"❌ Infs in gradient of {name}")
 
-def compute_cql_penalty(states, dataset_actions, model, num_action_samples=10, global_step=0):
+def compute_cql_penalty(states, dataset_actions, model, num_action_samples=10, global_step=0, epochs=100, dataloader_len=100):
     """
     Adaptive CQL penalty calculation with gradient regularization
     Args:
@@ -256,8 +259,8 @@ def compute_cql_penalty(states, dataset_actions, model, num_action_samples=10, g
     adaptive_factor = 1.0 + torch.tanh(q_spread/5.0)
     
     # New dynamic margin based on training progress
-    progress = min(global_step / 1e5, 1.0)  # Assuming 100k step training
-    margin = 5.0 * (1 - 0.9*progress)  # Decaying margin
+    progress = min(global_step / (epochs * dataloader_len), 1.0)  # 0→1 scale
+    margin = 3.0 * (1 - 0.95*progress)  # Start at 3.0, decay to 0.15
     
     # Add gradient regularization to prevent Q-value collapse
     q_penalty = torch.clamp(cql_penalty * adaptive_factor, min=-margin, max=margin)
@@ -302,7 +305,7 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
     )
     
     # Adjusted target entropy for better exploration-exploitation balance
-    target_entropy = -torch.tensor(action_dim * 1.5).to(device)  # Changed from 2.0
+    target_entropy = -torch.tensor(action_dim * 0.8).to(device)  # Reduced from 1.5 to prevent entropy collapse
     
     # Logging
     writer = SummaryWriter()
@@ -345,7 +348,8 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
             current_q2 = model.q2(torch.cat([states, dataset_actions], 1))
             
             td_loss = F.smooth_l1_loss(current_q1, target_q) + F.smooth_l1_loss(current_q2, target_q)
-            cql_penalty = compute_cql_penalty(states, dataset_actions, model, global_step=global_step)
+            cql_penalty = compute_cql_penalty(states, dataset_actions, model, global_step=global_step, 
+                                             epochs=epochs, dataloader_len=len(dataloader))
             # Apply cql_weight here instead of in the compute_cql_penalty function
             critic_loss = td_loss + cql_weight * cql_penalty
 
@@ -372,7 +376,7 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
             
             log_probs = normal.log_prob(x_t).sum(1)
             log_probs -= torch.log(1 - y_t.pow(2) + 1e-6).sum(1)
-            entropy = torch.clamp(log_probs.mean(), min=-10.0, max=10.0)
+            entropy = torch.clamp(log_probs.mean(), min=-1.0, max=2.0)  # Tighter constraints to prevent entropy collapse
             
             # Add entropy regularization scaling
             entropy_scale = torch.clamp(1.0 / (entropy.detach() + 1e-6), 0.1, 10.0)
@@ -388,8 +392,8 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
             # Add policy smoothing penalty
             smooth_penalty = F.mse_loss(q1_pred, q1_smooth) + F.mse_loss(q2_pred, q2_smooth)
             
-            # Combine losses with advantage guidance
-            actor_loss = -torch.min(q1_pred, q2_pred).mean() * 0.5 + alpha * entropy * entropy_scale + 0.1 * smooth_penalty - 0.01 * adv_value.mean()
+            # Combine losses without advantage guidance to prevent conflicting optimization
+            actor_loss = -torch.min(q1_pred, q2_pred).mean() * 0.5 + alpha * entropy * entropy_scale + 0.1 * smooth_penalty
 
             optimizer_actor.zero_grad()
             actor_loss.backward()
