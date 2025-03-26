@@ -83,7 +83,7 @@ class SACCQL(nn.Module):
         super().__init__()
         self.action_scale = 1.0  # Adjust to your insulin range (e.g., 0-5 units)
         # Add entropy temperature parameter with higher initialization
-        self.log_alpha = torch.nn.Parameter(torch.tensor([1.0], requires_grad=True))
+        self.log_alpha = torch.nn.Parameter(torch.tensor([2.0], requires_grad=True))
 
         # Stochastic Actor (Gaussian policy)
         self.actor = nn.Sequential(
@@ -234,19 +234,15 @@ def compute_cql_penalty(states, dataset_actions, model, num_action_samples=10):
     q1_data = model.q1(torch.cat([states, dataset_actions], dim=1))
     q2_data = model.q2(torch.cat([states, dataset_actions], dim=1))
     
-    # 6. CQL Penalty = logsumexp(Q_all) - mean(Q_dataset)
-    logsumexp = torch.logsumexp(
-        torch.cat([q1_all, q2_all], dim=1),  # Shape: (2*batch_size, 2)
-        dim=0
-    ).mean()
-    
+    # 6. Revised CQL penalty calculation
+    logsumexp_q1 = torch.logsumexp(q1_all, dim=0).mean()
+    logsumexp_q2 = torch.logsumexp(q2_all, dim=0).mean()
     dataset_q_mean = 0.5 * (q1_data.mean() + q2_data.mean())
     
-    # Modified CQL penalty with conservative margin
-    cql_penalty = logsumexp - dataset_q_mean
+    cql_penalty = (logsumexp_q1 + logsumexp_q2 - 2 * dataset_q_mean)
     
-    # Add conservative margin
-    margin = 5.0  # Controls how much we push down non-dataset actions
+    # Dynamic margin based on Q-values
+    margin = torch.clamp(5.0 / (torch.abs(dataset_q_mean) + 1e-6), 0.1, 10.0)
     return torch.clamp(cql_penalty, min=-margin, max=margin)  # Clamping to prevent Q-value collapse
 
 def train_offline(dataset_path, model, csv_file='training_stats.csv', 
@@ -332,7 +328,7 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
             
             log_probs = normal.log_prob(x_t).sum(1)
             log_probs -= torch.log(1 - y_t.pow(2) + 1e-6).sum(1)
-            entropy = -log_probs.mean()
+            entropy = log_probs.mean()  # Removed negative sign to fix entropy calculation
             
             # Add entropy regularization scaling
             entropy_scale = torch.clamp(1.0 / (entropy.detach() + 1e-6), 0.1, 10.0)
