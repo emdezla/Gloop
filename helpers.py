@@ -366,7 +366,7 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
             
             log_probs = normal.log_prob(x_t).sum(1)
             log_probs -= torch.log(1 - y_t.pow(2) + 1e-6).sum(1)
-            entropy = log_probs.mean()
+            entropy = torch.clamp(log_probs.mean(), min=-10.0, max=10.0)
             
             # Add entropy regularization scaling
             entropy_scale = torch.clamp(1.0 / (entropy.detach() + 1e-6), 0.1, 10.0)
@@ -390,8 +390,8 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
             actor_grad_norm = torch.nn.utils.clip_grad_norm_(model.actor.parameters(), 0.5).item()
             optimizer_actor.step()
             
-            # Alpha optimization with entropy momentum
-            alpha_loss = -(model.log_alpha * (0.9*entropy + 0.1*entropy.detach() - target_entropy)).mean()
+            # Alpha optimization with detached entropy
+            alpha_loss = -(model.log_alpha * (entropy.detach() - target_entropy)).mean()
             optimizer_alpha.zero_grad()
             alpha_loss.backward()
             torch.nn.utils.clip_grad_norm_([model.log_alpha], 0.5)
