@@ -8,47 +8,86 @@ from tqdm import tqdm
 import csv
 from torch.utils.tensorboard import SummaryWriter
 
+# Custom Mish activation for improved training stability
+class Mish(nn.Module):
+    def forward(self, x):
+        return x * torch.tanh(F.softplus(x))
+
 class SimpleSAC(nn.Module):
     def __init__(self):
         super().__init__()
-        # Actor - simple deterministic network
+        # Actor - simple deterministic network with improved capacity
         self.actor = nn.Sequential(
-            nn.Linear(8, 64),
-            nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.ReLU(),
-            nn.Linear(64, 2),
+            nn.Linear(8, 128),
+            nn.LayerNorm(128),
+            Mish(),
+            nn.Linear(128, 128),
+            nn.LayerNorm(128),
+            Mish(),
+            nn.Linear(128, 2),
             nn.Tanh()
         )
         
-        # Critic - single Q-network
-        self.critic = nn.Sequential(
-            nn.Linear(10, 64),  # state + action
-            nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
+        # Twin Critics - to reduce overestimation bias
+        self.critic1 = nn.Sequential(
+            nn.Linear(10, 256),  # state + action
+            nn.LayerNorm(256),
+            Mish(),
+            nn.Linear(256, 256),
+            nn.LayerNorm(256),
+            Mish(),
+            nn.Linear(256, 1)
         )
         
-        # Target network for stability
-        self.critic_target = nn.Sequential(
-            nn.Linear(10, 64),
-            nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
+        self.critic2 = nn.Sequential(
+            nn.Linear(10, 256),  # state + action
+            nn.LayerNorm(256),
+            Mish(),
+            nn.Linear(256, 256),
+            nn.LayerNorm(256),
+            Mish(),
+            nn.Linear(256, 1)
         )
-        self.critic_target.load_state_dict(self.critic.state_dict())
         
-        # Disable gradient tracking for target network
-        for param in self.critic_target.parameters():
+        # Target networks for stability
+        self.critic1_target = nn.Sequential(
+            nn.Linear(10, 256),
+            nn.LayerNorm(256),
+            Mish(),
+            nn.Linear(256, 256),
+            nn.LayerNorm(256),
+            Mish(),
+            nn.Linear(256, 1)
+        )
+        
+        self.critic2_target = nn.Sequential(
+            nn.Linear(10, 256),
+            nn.LayerNorm(256),
+            Mish(),
+            nn.Linear(256, 256),
+            nn.LayerNorm(256),
+            Mish(),
+            nn.Linear(256, 1)
+        )
+        
+        self.critic1_target.load_state_dict(self.critic1.state_dict())
+        self.critic2_target.load_state_dict(self.critic2.state_dict())
+        
+        # Disable gradient tracking for target networks
+        for param in self.critic1_target.parameters():
+            param.requires_grad = False
+        for param in self.critic2_target.parameters():
             param.requires_grad = False
 
-    def act(self, state):
-        return self.actor(state)
+    def act(self, state, noise_scale=0.1):
+        action = self.actor(state)
+        if self.training:  # Add noise only during training
+            noise = torch.randn_like(action) * noise_scale
+            return torch.clamp(action + noise, -1, 1)
+        return action
 
-def train_basic(dataset_path, csv_file='basic_training_stats.csv', epochs=100, 
-                lr=3e-4, batch_size=256, print_interval=10):
+def train_basic(dataset_path, csv_file='basic_training_stats.csv', epochs=500, 
+                lr=1e-4, batch_size=256, print_interval=10):
     # Setup data
     dataset = DiabetesDataset(dataset_path)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -58,9 +97,10 @@ def train_basic(dataset_path, csv_file='basic_training_stats.csv', epochs=100,
     optimizer = optim.Adam(model.parameters(), lr=lr)
     
     # Fixed hyperparameters
-    gamma = 0.99  # Discount factor
-    tau = 0.01    # Target network update rate
-    bc_weight = 0.1  # Behavioral cloning weight
+    gamma = 0.95  # Discount factor - reduced for medical domain
+    tau = 0.02    # Target network update rate - faster updates
+    bc_weight = 0.3  # Behavioral cloning weight - increased regularization
+    grad_penalty_weight = 0.1  # Weight for gradient penalty
     
     # Logging
     writer = SummaryWriter()
@@ -92,19 +132,42 @@ def train_basic(dataset_path, csv_file='basic_training_stats.csv', epochs=100,
             
             # Critic Update
             with torch.no_grad():
-                next_actions = model.actor(next_states)
-                target_q = rewards + (1 - dones) * gamma * model.critic_target(
-                    torch.cat([next_states, next_actions], 1))
+                next_actions = model.act(next_states, noise_scale=0.05)
+                target_q1 = model.critic1_target(torch.cat([next_states, next_actions], 1))
+                target_q2 = model.critic2_target(torch.cat([next_states, next_actions], 1))
+                # Use minimum of two Q-values to reduce overestimation bias
+                target_q = torch.min(target_q1, target_q2)
+                target_q = rewards + (1 - dones) * gamma * target_q
             
-            current_q = model.critic(torch.cat([states, actions], 1))
-            td_loss = F.mse_loss(current_q, target_q)
+            # Current Q-values from both critics
+            current_q1 = model.critic1(torch.cat([states, actions], 1))
+            current_q2 = model.critic2(torch.cat([states, actions], 1))
             
-            # Behavioral Cloning Loss
-            pred_actions = model.actor(states)
+            # TD losses for both critics
+            td_loss1 = F.mse_loss(current_q1, target_q)
+            td_loss2 = F.mse_loss(current_q2, target_q)
+            td_loss = td_loss1 + td_loss2
+            
+            # Add gradient penalty to prevent critic collapse
+            critic_inputs = torch.cat([states, actions], 1).requires_grad_(True)
+            critic1_outputs = model.critic1(critic_inputs)
+            critic1_gradients = torch.autograd.grad(
+                outputs=critic1_outputs.sum(),
+                inputs=critic_inputs,
+                create_graph=True
+            )[0]
+            grad_penalty = grad_penalty_weight * (critic1_gradients.norm(2) - 1).pow(2).mean()
+            td_loss += grad_penalty
+            
+            # Behavioral Cloning Loss with annealed weighting
+            pred_actions = model.act(states, noise_scale=0.0)  # No noise for BC loss
             bc_loss = F.mse_loss(pred_actions, actions)
             
+            # Annealed BC weight that increases over time
+            effective_bc_weight = bc_weight * (1 + epoch/epochs)
+            
             # Total Loss
-            total_loss = td_loss + bc_weight * bc_loss
+            total_loss = td_loss + effective_bc_weight * bc_loss
             
             # Optimization step
             optimizer.zero_grad()
@@ -114,14 +177,16 @@ def train_basic(dataset_path, csv_file='basic_training_stats.csv', epochs=100,
             
             # Target Network Update
             with torch.no_grad():
-                for t_param, param in zip(model.critic_target.parameters(), model.critic.parameters()):
+                for t_param, param in zip(model.critic1_target.parameters(), model.critic1.parameters()):
+                    t_param.data.copy_(tau * param.data + (1 - tau) * t_param.data)
+                for t_param, param in zip(model.critic2_target.parameters(), model.critic2.parameters()):
                     t_param.data.copy_(tau * param.data + (1 - tau) * t_param.data)
             
             # Metrics
             epoch_td_loss += td_loss.item()
             epoch_bc_loss += bc_loss.item()
             epoch_total_loss += total_loss.item()
-            epoch_q_value += current_q.mean().item()
+            epoch_q_value += (current_q1.mean().item() + current_q2.mean().item()) / 2
             epoch_action_mean += pred_actions.mean().item()
             epoch_action_std += pred_actions.std().item()
             batch_count += 1
@@ -174,7 +239,7 @@ def train_basic(dataset_path, csv_file='basic_training_stats.csv', epochs=100,
 if __name__ == "__main__":
     train_basic(
         dataset_path="datasets/processed/563-train.csv",
-        epochs=100,
-        lr=3e-4,
+        epochs=500,
+        lr=1e-4,
         batch_size=256
     )
