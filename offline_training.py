@@ -5,7 +5,7 @@ if __name__ == "__main__":
     config = {
         "dataset_path": "datasets/processed/563-train.csv",
         "csv_file": "training_stats.csv",
-        "epochs": 1000,
+        "epochs": 60,
         "batch_size": 256,
         "device": device,
         "cql_weight": 0.25,
