@@ -19,7 +19,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 state_dim = 8
 action_dim = 2  
 alpha = 0.2  
-cql_weight = 0.25  
+cql_weight = 0.1  # Reduced from 0.25 to 0.1 for less conservative Q-values
 batch_size = 256
 
 
@@ -82,6 +82,8 @@ class SACCQL(nn.Module):
     def __init__(self): 
         super().__init__()
         self.action_scale = 1.0  # Adjust to your insulin range (e.g., 0-5 units)
+        # Add entropy temperature parameter
+        self.log_alpha = torch.nn.Parameter(torch.tensor([0.0], requires_grad=True))
 
         # Stochastic Actor (Gaussian policy)
         self.actor = nn.Sequential(
@@ -94,6 +96,9 @@ class SACCQL(nn.Module):
         )
         self.mean = nn.Linear(256, 2)
         self.log_std = nn.Linear(256, 2)
+        # Initialize small weights for stability
+        nn.init.uniform_(self.mean.weight, -0.003, 0.003)
+        nn.init.uniform_(self.log_std.weight, -0.003, 0.003)
 
         # Twin Critics with CQL
         def create_q():
@@ -121,7 +126,7 @@ class SACCQL(nn.Module):
         hidden = self.actor(state)
         mean = self.mean(hidden)
         log_std = self.log_std(hidden)
-        log_std = torch.clamp(log_std, min=-20, max=2)  # Stability
+        log_std = torch.clamp(log_std, min=-5, max=0.5)  # Changed from (-20, 2) for better stability
         return mean, log_std
 
     def act(self, state, deterministic=False):
@@ -251,6 +256,8 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
     optimizer_critic = optim.Adam(
         list(model.q1.parameters()) + list(model.q2.parameters()), lr=3e-4
     )
+    optimizer_alpha = optim.Adam([model.log_alpha], lr=1e-4)
+    target_entropy = -torch.tensor(action_dim).to(device)  # Target entropy = -action_dim
     
     # Logging
     writer = SummaryWriter()
@@ -297,9 +304,14 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
 
             optimizer_critic.zero_grad()
             critic_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.q1.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.q2.parameters(), 1.0)
             optimizer_critic.step()
 
             # --- Actor Update ---
+            with torch.no_grad():
+                alpha = model.log_alpha.exp().detach()
+                
             mean, log_std = model(states)
             std = log_std.exp()
             normal = torch.distributions.Normal(mean, std)
@@ -317,7 +329,14 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
 
             optimizer_actor.zero_grad()
             actor_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.actor.parameters(), 0.5)
             optimizer_actor.step()
+            
+            # Alpha optimization
+            alpha_loss = -(model.log_alpha * (entropy - target_entropy).detach()).mean()
+            optimizer_alpha.zero_grad()
+            alpha_loss.backward()
+            optimizer_alpha.step()
 
             # --- Target Update ---
             model.update_targets(tau)
@@ -332,6 +351,8 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
             metrics['action_mean'] += pred_actions.mean().item()
             metrics['action_std'] += pred_actions.std().item()
             metrics['entropy'] += entropy.item()
+            metrics['alpha'] = alpha.item()
+            metrics['alpha_loss'] = alpha_loss.item()
             batch_count += 1
             global_step += 1
 
@@ -352,7 +373,7 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
                         avg_metrics['critic'], avg_metrics['actor'],
                         avg_metrics['q1'], avg_metrics['q2'],
                         avg_metrics['action_mean'], avg_metrics['action_std'],
-                        avg_metrics['entropy']
+                        avg_metrics['entropy'], avg_metrics['alpha'], avg_metrics['alpha_loss']
                     ])
                 
                 metrics = defaultdict(float)
