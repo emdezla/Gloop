@@ -12,6 +12,16 @@ import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm  # For progress bar
 
+
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+state_dim = 8
+action_dim = 2  
+alpha = 0.2  
+cql_weight = 0.25  
+batch_size = 256
+
+
 class DiabetesDataset(Dataset):
     def __init__(self, csv_file):
         # Load and clean CSV data
@@ -68,27 +78,26 @@ class DiabetesDataset(Dataset):
         }
 
 class SACCQL(nn.Module):
-
-    def __init__(self):
+    def __init__(self): 
         super().__init__()
         self.action_scale = 1.0  # Adjust to your insulin range (e.g., 0-5 units)
 
         # Stochastic Actor (Gaussian policy)
         self.actor = nn.Sequential(
-            nn.Linear(state_dim, 256),
+            nn.Linear(8, 256),
             nn.LayerNorm(256),  # Added for stability
             nn.ReLU(),
             nn.Linear(256, 256),
             nn.LayerNorm(256),
             nn.ReLU(),
         )
-        self.mean = nn.Linear(256, action_dim)
-        self.log_std = nn.Linear(256, action_dim)
+        self.mean = nn.Linear(256, 2)
+        self.log_std = nn.Linear(256, 2)
 
         # Twin Critics with CQL
         def create_q():
             return nn.Sequential(
-                nn.Linear(state_dim + action_dim, 256),
+                nn.Linear(10, 256),
                 nn.LayerNorm(256),
                 nn.ReLU(),
                 nn.Linear(256, 256),
