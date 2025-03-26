@@ -82,23 +82,25 @@ class SACCQL(nn.Module):
     def __init__(self): 
         super().__init__()
         self.action_scale = 1.0  # Adjust to your insulin range (e.g., 0-5 units)
-        # Add entropy temperature parameter
-        self.log_alpha = torch.nn.Parameter(torch.tensor([0.0], requires_grad=True))
+        # Add entropy temperature parameter with higher initialization
+        self.log_alpha = torch.nn.Parameter(torch.tensor([1.0], requires_grad=True))
 
         # Stochastic Actor (Gaussian policy)
         self.actor = nn.Sequential(
             nn.Linear(8, 256),
             nn.LayerNorm(256),  # Added for stability
             nn.ReLU(),
+            nn.Dropout(0.1),  # Added dropout to prevent overfitting
             nn.Linear(256, 256),
             nn.LayerNorm(256),
             nn.ReLU(),
+            nn.Dropout(0.1),  # Added dropout
         )
         self.mean = nn.Linear(256, 2)
         self.log_std = nn.Linear(256, 2)
-        # Initialize small weights for stability
-        nn.init.uniform_(self.mean.weight, -0.003, 0.003)
-        nn.init.uniform_(self.log_std.weight, -0.003, 0.003)
+        # Initialize with larger weights for better exploration
+        nn.init.uniform_(self.mean.weight, -0.1, 0.1)
+        nn.init.constant_(self.log_std.weight, -1.0)  # Safer initialization
 
         # Twin Critics with CQL
         def create_q():
@@ -240,7 +242,12 @@ def compute_cql_penalty(states, dataset_actions, model, num_action_samples=10):
     
     dataset_q_mean = 0.5 * (q1_data.mean() + q2_data.mean())
     
-    return logsumexp - dataset_q_mean
+    # Modified CQL penalty with conservative margin
+    cql_penalty = logsumexp - dataset_q_mean
+    
+    # Add conservative margin
+    margin = 5.0  # Controls how much we push down non-dataset actions
+    return torch.clamp(cql_penalty, min=-margin, max=margin)  # Clamping to prevent Q-value collapse
 
 def train_offline(dataset_path, model, csv_file='training_stats.csv', 
                  epochs=1000, batch_size=256, print_interval=100,
@@ -258,7 +265,7 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
         lr=3e-4,
         weight_decay=1e-4  # Added weight decay
     )
-    optimizer_alpha = optim.Adam([model.log_alpha], lr=3e-5)  # Reduced from 1e-4
+    optimizer_alpha = optim.Adam([model.log_alpha], lr=1e-4)  # Increased from 3e-5 for better adaptation
     target_entropy = -torch.tensor(action_dim).to(device)  # Target entropy = -action_dim
     
     # Logging
@@ -303,6 +310,7 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
             
             td_loss = F.smooth_l1_loss(current_q1, target_q) + F.smooth_l1_loss(current_q2, target_q)
             cql_penalty = compute_cql_penalty(states, dataset_actions, model)
+            # Apply cql_weight here instead of in the compute_cql_penalty function
             critic_loss = td_loss + cql_weight * cql_penalty
 
             optimizer_critic.zero_grad()
@@ -325,10 +333,13 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
             log_probs = normal.log_prob(x_t).sum(1)
             log_probs -= torch.log(1 - y_t.pow(2) + 1e-6).sum(1)
             entropy = -log_probs.mean()
+            
+            # Add entropy regularization scaling
+            entropy_scale = torch.clamp(1.0 / (entropy.detach() + 1e-6), 0.1, 10.0)
 
             q1_pred = model.q1(torch.cat([states, pred_actions], 1))
             q2_pred = model.q2(torch.cat([states, pred_actions], 1))
-            actor_loss = -torch.min(q1_pred, q2_pred).mean() + alpha * entropy
+            actor_loss = -torch.min(q1_pred, q2_pred).mean() * 0.5 + alpha * entropy * entropy_scale
 
             optimizer_actor.zero_grad()
             actor_loss.backward()
@@ -339,7 +350,7 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
             alpha_loss = -(model.log_alpha * (entropy - target_entropy).detach()).mean()
             optimizer_alpha.zero_grad()
             alpha_loss.backward()
-            torch.nn.utils.clip_grad_norm_([model.log_alpha], 0.1)  # Added clipping
+            torch.nn.utils.clip_grad_norm_([model.log_alpha], 0.5)  # Increased clipping threshold
             optimizer_alpha.step()
 
             # --- Target Update ---
