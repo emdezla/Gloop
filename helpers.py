@@ -203,7 +203,12 @@ def compute_cql_penalty(states, dataset_actions, model, num_action_samples=10):
     
     # 1. Get policy-generated actions (from current actor)
     with torch.no_grad():
-        policy_actions = model.actor(states)  # (batch_size, action_dim)
+        mean, log_std = model(states)
+        std = log_std.exp()
+        normal = torch.distributions.Normal(mean, std)
+        x_t = normal.rsample()
+        y_t = torch.tanh(x_t)
+        policy_actions = y_t * model.action_scale
     
     # 2. Combine dataset actions + policy actions
     # Shape: (2*batch_size, action_dim)
