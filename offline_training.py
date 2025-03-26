@@ -3,16 +3,16 @@ from basic_offline_training import SimpleSAC, train_basic
 from SAC_training import SACAgent, train_sac_offline
 
 if __name__ == "__main__":
-    # Configuration for original complex model
+    # Configuration for original complex model with improved stability parameters
     complex_config = {
         "dataset_path": "datasets/processed/563-train.csv",
         "csv_file": "complex_training_stats.csv",
         "epochs": 200,
-        "batch_size": 2048,
+        "batch_size": 256,  # Reduced batch size for better stability
         "device": device,
-        "cql_weight": 0.008,
-        "alpha": 0.2,
-        "tau": 0.05
+        "cql_weight": 0.01,  # Slightly increased
+        "alpha": 0.1,  # Reduced from 0.2 for more conservative exploration
+        "tau": 0.005  # More conservative target update rate
     }
     
     # Configuration for simplified model
@@ -60,7 +60,10 @@ if __name__ == "__main__":
         cql_weight=complex_config["cql_weight"],
         tau=complex_config["tau"]
     )
+    
+    # Save checkpoints at different intervals
     torch.save(trained_complex_model.state_dict(), "sac_cql_final.pth")
+    print(f"Model saved to sac_cql_final.pth")
 
     
     # Option 3: Train the LSTM-based SAC model

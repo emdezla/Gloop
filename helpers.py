@@ -13,6 +13,11 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm  # For progress bar
 from collections import defaultdict
 
+# Custom activation function for better gradient flow
+class Mish(nn.Module):
+    def forward(self, x):
+        return x * torch.tanh(F.softplus(x))
+
 # Global settings
 device = "cuda" if torch.cuda.is_available() else "cpu"
 state_dim = 8
@@ -130,43 +135,38 @@ class SACCQL(nn.Module):
     def __init__(self): 
         super().__init__()
         self.action_scale = 1.0  # Adjust to your insulin range (e.g., 0-5 units)
-        # Add entropy temperature parameter with higher initialization
-        self.log_alpha = torch.nn.Parameter(torch.tensor([2.0], requires_grad=True))
-        # Remove Q-value normalization layer for better gradient flow
+        # More conservative alpha initialization
+        self.log_alpha = torch.nn.Parameter(torch.tensor([0.0], requires_grad=True))
 
-        # Improved Stochastic Actor (Gaussian policy)
+        # Simplified and stabilized actor architecture
         self.actor = nn.Sequential(
-            nn.Linear(8, 512),
-            nn.BatchNorm1d(512),  # More stable than LayerNorm for gradient flow
-            nn.LeakyReLU(0.1),
-            nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
-            nn.LeakyReLU(0.1),
-            nn.Linear(256, 256),
-            nn.Dropout(0.1),  # Reduced dropout rate
-        )
-        
-        # Advantage estimation head
-        self.adv_head = nn.Sequential(
+            nn.Linear(8, 256),
+            nn.LayerNorm(256),
+            Mish(),
             nn.Linear(256, 128),
-            nn.LeakyReLU(0.1),
-            nn.Linear(128, 1)
+            nn.LayerNorm(128),
+            Mish()
         )
         
-        self.mean = nn.Linear(256, 2)
-        self.log_std = nn.Linear(256, 2)
-        # Orthogonal initialization for better exploration
-        nn.init.orthogonal_(self.mean.weight, gain=0.01)
-        nn.init.constant_(self.log_std.weight, -1.0)  # Safer initialization
+        # Mean and log_std layers
+        self.mean = nn.Linear(128, 2)
+        self.log_std = nn.Linear(128, 2)
+        
+        # Initialize with small weights for better stability
+        nn.init.uniform_(self.mean.weight, -0.003, 0.003)
+        nn.init.uniform_(self.log_std.weight, -0.003, 0.003)
+        nn.init.constant_(self.log_std.bias, -1.0)
 
-        # Twin Critics with CQL - Revised architecture for better gradient flow
+        # Twin Critics with stabilized architecture
         def create_q():
             return nn.Sequential(
-                nn.Linear(10, 512),
-                nn.SiLU(),  # Changed from ReLU
-                nn.Linear(512, 512),  # Deeper network
-                nn.LeakyReLU(0.1),  # Better gradient flow than SiLU
-                nn.Linear(512, 1)
+                nn.Linear(10, 256),
+                nn.LayerNorm(256),
+                Mish(),
+                nn.Linear(256, 128),
+                nn.LayerNorm(128),
+                Mish(),
+                nn.Linear(128, 1)
             )
         
         self.q1 = create_q()
@@ -183,7 +183,7 @@ class SACCQL(nn.Module):
         hidden = self.actor(state)
         mean = self.mean(hidden)
         log_std = self.log_std(hidden)
-        log_std = torch.clamp(log_std, min=-5, max=0.5)  # Changed from (-20, 2) for better stability
+        log_std = torch.clamp(log_std, min=-5, max=0.5)  # Constrain log_std for stability
         return mean, log_std
 
     def act(self, state, deterministic=False):
@@ -195,10 +195,12 @@ class SACCQL(nn.Module):
             normal = torch.distributions.Normal(mean, std)
             x_t = normal.rsample()  # Reparameterization
             action = torch.tanh(x_t) * self.action_scale
-        return action
+        
+        # Add action clamping for stability
+        return torch.clamp(action, -self.action_scale, self.action_scale)
 
     def update_targets(self, tau=0.005):
-        # Soft update: target = tau * main + (1-tau) * target
+        # Soft update with more conservative tau
         with torch.no_grad():
             for t, m in zip(self.q1_target.parameters(), self.q1.parameters()):
                 t.data.copy_(tau * m.data + (1 - tau) * t.data)
@@ -207,7 +209,7 @@ class SACCQL(nn.Module):
 
 def compute_cql_penalty(states, dataset_actions, model, num_action_samples=10, global_step=0, epochs=100, dataloader_len=100):
     """
-    Adaptive CQL penalty calculation with gradient regularization
+    Improved CQL penalty calculation with normalization for stability
     Args:
         states: Current states from batch (batch_size, state_dim)
         dataset_actions: Actions taken in the dataset (batch_size, action_dim)
@@ -241,64 +243,72 @@ def compute_cql_penalty(states, dataset_actions, model, num_action_samples=10, g
     q1_data = model.q1(torch.cat([states, dataset_actions], dim=1))
     q2_data = model.q2(torch.cat([states, dataset_actions], dim=1))
     
-    # 6. Revised CQL penalty calculation
-    logsumexp_q1 = torch.logsumexp(q1_all, dim=0).mean()
-    logsumexp_q2 = torch.logsumexp(q2_all, dim=0).mean()
-    dataset_q_mean = 0.5 * (q1_data.mean() + q2_data.mean())
+    # 6. Improved CQL penalty calculation with normalization
+    # Normalize Q-values before logsumexp for numerical stability
+    q1_mean = q1_all.mean().detach()
+    q2_mean = q2_all.mean().detach()
+    q1_std = q1_all.std().detach() + 1e-8
+    q2_std = q2_all.std().detach() + 1e-8
+    
+    normalized_q1 = (q1_all - q1_mean) / q1_std
+    normalized_q2 = (q2_all - q2_mean) / q2_std
+    
+    logsumexp_q1 = torch.logsumexp(normalized_q1, dim=0).mean()
+    logsumexp_q2 = torch.logsumexp(normalized_q2, dim=0).mean()
+    
+    normalized_q1_data = (q1_data - q1_mean) / q1_std
+    normalized_q2_data = (q2_data - q2_mean) / q2_std
+    dataset_q_mean = 0.5 * (normalized_q1_data.mean() + normalized_q2_data.mean())
     
     cql_penalty = (logsumexp_q1 + logsumexp_q2 - 2 * dataset_q_mean)
     
-    # Adaptive CQL weight based on Q-value spread - less aggressive scaling
-    q_std = 0.5 * (torch.std(q1_all) + torch.std(q2_all)) + 1e-6
-    adaptive_factor = 1.0 + 0.5 * torch.tanh(q_std/3.0)
+    # Constrain penalty for stability
+    cql_penalty = torch.clamp(cql_penalty, min=-1.0, max=5.0)
     
-    # Dynamic margin based on Q-value standard deviation
-    margin = torch.clamp(3.0 * q_std, min=0.1, max=5.0)
-    
-    # Add gradient regularization to prevent Q-value collapse
-    q_penalty = torch.clamp(cql_penalty * adaptive_factor, min=-margin, max=margin)
-    
-    return q_penalty
+    return cql_penalty * 0.1  # Reduced scale for better stability
 
 def train_offline(dataset_path, model, csv_file='training_stats.csv', 
                  epochs=1000, batch_size=256, print_interval=100,
-                 device="cuda", alpha=0.2, cql_weight=0.25, tau=0.01):  # Increased tau from 0.005 to 0.01
+                 device="cuda", alpha=0.2, cql_weight=0.25, tau=0.005):  # More conservative tau
     """Main training loop for offline CQL-based SAC."""
     # Dataset setup
     dataset = DiabetesDataset(csv_file=dataset_path)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     model = model.to(device)
     
-    # Optimizers with different learning rates
-    optimizer_actor = optim.Adam(
+    # Optimizers with AdamW for better regularization
+    optimizer_actor = optim.AdamW(
         list(model.actor.parameters()) + 
         list(model.mean.parameters()) + 
-        list(model.log_std.parameters()) +
-        list(model.adv_head.parameters()), 
-        lr=1e-4  # Reduced learning rate for actor
-    )
-    optimizer_critic = optim.Adam(
-        list(model.q1.parameters()) + list(model.q2.parameters()), 
-        lr=3e-4,  # Increased from 1e-4
+        list(model.log_std.parameters()), 
+        lr=1e-4,  # Conservative learning rate
         weight_decay=1e-4
     )
-    optimizer_alpha = optim.Adam([model.log_alpha], lr=1e-4)
+    optimizer_critic = optim.AdamW(
+        list(model.q1.parameters()) + list(model.q2.parameters()), 
+        lr=3e-4,
+        weight_decay=1e-4
+    )
+    optimizer_alpha = optim.AdamW([model.log_alpha], lr=1e-4, weight_decay=1e-5)
     
-    # Learning rate schedulers
+    # Learning rate schedulers with more conservative settings
     scheduler_critic = optim.lr_scheduler.OneCycleLR(
         optimizer_critic, 
         max_lr=3e-4,
         total_steps=epochs*len(dataloader),
         pct_start=0.3,
+        div_factor=10.0,  # More conservative LR range
+        final_div_factor=50.0,
         anneal_strategy='cos'
     )
     scheduler_actor = optim.lr_scheduler.CosineAnnealingLR(
         optimizer_actor,
-        T_max=10*len(dataloader)
+        T_max=10*len(dataloader),
+        eta_min=1e-5  # Prevent LR from going too low
     )
     
-    # Adjusted target entropy for better exploration-exploitation balance
-    target_entropy = torch.tensor(0.5 * action_dim).to(device)  # Positive value to encourage exploration
+    # More conservative target entropy
+    target_entropy = -torch.tensor(action_dim/2.0).to(device)  # Negative value is standard
     
     # Logging
     writer = SummaryWriter()
@@ -319,44 +329,65 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
         batch_count = 0
         
         for i, batch in enumerate(dataloader):
-            # Device transfer
-            states = batch["state"].to(device)
+            # Device transfer with input normalization for stability
+            states_raw = batch["state"]
+            # Normalize states for better training stability
+            states_mean = states_raw.mean(dim=0, keepdim=True)
+            states_std = states_raw.std(dim=0, keepdim=True) + 1e-8
+            states = ((states_raw - states_mean) / states_std).to(device)
+            
             dataset_actions = batch["action"].to(device)
             rewards = batch["reward"].to(device).unsqueeze(1)
-            next_states = batch["next_state"].to(device)
+            
+            next_states_raw = batch["next_state"]
+            # Apply same normalization to next_states
+            next_states = ((next_states_raw - states_mean) / states_std).to(device)
+            
             dones = batch["done"].to(device).unsqueeze(1)
 
-            # --- Critic Update ---
+            # --- Critic Update with improved stability ---
             with torch.no_grad():
                 next_mean, next_log_std = model(next_states)
                 next_std = next_log_std.exp()
                 next_normal = torch.distributions.Normal(next_mean, next_std)
-                next_actions = torch.tanh(next_normal.rsample()) * model.action_scale
+                next_actions_raw = torch.tanh(next_normal.rsample()) * model.action_scale
+                # Clamp actions for stability
+                next_actions = torch.clamp(next_actions_raw, -model.action_scale, model.action_scale)
                 
                 q1_next = model.q1_target(torch.cat([next_states, next_actions], 1))
                 q2_next = model.q2_target(torch.cat([next_states, next_actions], 1))
+                # Add noise to target Q-values for regularization
+                target_noise = torch.randn_like(q1_next) * 0.1
+                q1_next = q1_next + torch.clamp(target_noise, -0.5, 0.5)
+                q2_next = q2_next + torch.clamp(-target_noise, -0.5, 0.5)  # Negated for decorrelation
+                
                 target_q = rewards + (1 - dones) * 0.99 * torch.min(q1_next, q2_next)
+                # Clamp target values for stability
+                target_q = torch.clamp(target_q, -50.0, 0.0)
 
             current_q1 = model.q1(torch.cat([states, dataset_actions], 1))
             current_q2 = model.q2(torch.cat([states, dataset_actions], 1))
             
-            td_loss = F.smooth_l1_loss(current_q1, target_q) + F.smooth_l1_loss(current_q2, target_q)
+            # Huber loss is more robust to outliers than MSE
+            td_loss = F.huber_loss(current_q1, target_q, reduction='mean') + F.huber_loss(current_q2, target_q, reduction='mean')
+            
             cql_penalty = compute_cql_penalty(states, dataset_actions, model, global_step=global_step, 
                                              epochs=epochs, dataloader_len=len(dataloader))
-            # Apply cql_weight here instead of in the compute_cql_penalty function
-            # Add gradient penalty to prevent Q-value collapse
+            
+            # More conservative gradient penalty
             grad_pen = 0.001 * (current_q1.pow(2).mean() + current_q2.pow(2).mean())
             critic_loss = td_loss + cql_weight * cql_penalty + grad_pen
 
             optimizer_critic.zero_grad()
             critic_loss.backward()
-            q1_grad_norm = torch.nn.utils.clip_grad_norm_(model.q1.parameters(), 1.0).item()
-            q2_grad_norm = torch.nn.utils.clip_grad_norm_(model.q2.parameters(), 1.0).item()
+            # More conservative gradient clipping
+            q1_grad_norm = torch.nn.utils.clip_grad_norm_(model.q1.parameters(), 0.5).item()
+            q2_grad_norm = torch.nn.utils.clip_grad_norm_(model.q2.parameters(), 0.5).item()
             optimizer_critic.step()
 
-            # --- Actor Update ---
+            # --- Actor Update with improved stability ---
             with torch.no_grad():
-                alpha = model.log_alpha.exp().detach()
+                alpha = torch.clamp(model.log_alpha.exp().detach(), min=0.01, max=1.0)
                 
             mean, log_std = model(states)
             std = log_std.exp()
@@ -365,50 +396,66 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
             y_t = torch.tanh(x_t)
             pred_actions = y_t * model.action_scale
             
-            # Policy smoothing regularization
-            noise = torch.randn_like(pred_actions) * 0.1
+            # Policy smoothing with reduced noise
+            noise = torch.randn_like(pred_actions) * 0.05
             smooth_actions = torch.clamp(pred_actions + noise, -model.action_scale, model.action_scale)
             
-            log_probs = normal.log_prob(x_t).sum(1)
-            log_probs -= torch.log(1 - y_t.pow(2) + 1e-6).sum(1)
-            # Proper entropy calculation (negative log prob)
-            entropy = -log_probs.mean()
-            # Reasonable bounds for entropy
-            entropy = torch.clamp(entropy, min=0.1, max=2.0)
+            # Compute log probs with numerical stability improvements
+            log_probs = normal.log_prob(x_t)
+            # Avoid extreme values in the correction term
+            correction = torch.log(1 - y_t.pow(2) + 1e-6)
+            # Clamp correction term to prevent numerical issues
+            correction = torch.clamp(correction, min=-10.0, max=0.0)
+            log_probs = log_probs - correction
+            log_probs = log_probs.sum(1, keepdim=True)
             
-            # Add entropy regularization scaling
-            entropy_scale = torch.clamp(1.0 / (entropy.detach() + 1e-6), 0.1, 10.0)
-
-            # Compute advantage using the advantage head
-            adv_value = model.adv_head(model.actor(states)).squeeze()
+            # Clamp log probs to prevent extreme values
+            log_probs = torch.clamp(log_probs, min=-20.0, max=2.0)
             
+            # Compute Q-values for policy actions
             q1_pred = model.q1(torch.cat([states, pred_actions], 1))
             q2_pred = model.q2(torch.cat([states, pred_actions], 1))
             q1_smooth = model.q1(torch.cat([states, smooth_actions], 1))
             q2_smooth = model.q2(torch.cat([states, smooth_actions], 1))
             
-            # Add policy smoothing penalty
-            smooth_penalty = F.mse_loss(q1_pred, q1_smooth) + F.mse_loss(q2_pred, q2_smooth)
+            # Reduced smoothing penalty
+            smooth_penalty = 0.05 * (F.mse_loss(q1_pred, q1_smooth) + F.mse_loss(q2_pred, q2_smooth))
             
-            # Revised conservative actor loss to prevent over-optimization
+            # Simplified actor loss with better numerical stability
             q_min = torch.min(q1_pred, q2_pred)
-            actor_loss = -(q_min - 0.1 * q_min.std()).mean() + alpha * entropy + 0.1 * smooth_penalty
+            # Detach q_min for more stable gradients
+            actor_loss = -(q_min.detach() - alpha * log_probs).mean() + smooth_penalty
 
             optimizer_actor.zero_grad()
             actor_loss.backward()
-            actor_grad_norm = torch.nn.utils.clip_grad_norm_(model.actor.parameters(), 0.5).item()
+            # More conservative gradient clipping
+            actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+                list(model.actor.parameters()) + 
+                list(model.mean.parameters()) + 
+                list(model.log_std.parameters()),
+                0.5
+            ).item()
             optimizer_actor.step()
             
-            # Alpha optimization with detached entropy
-            alpha_loss = -(model.log_alpha * (entropy.detach() - target_entropy)).mean()
+            # Alpha optimization with improved stability
+            # Compute entropy directly from log_probs
+            entropy = -log_probs.mean()
+            
+            # Clamp entropy for stability
+            entropy_detached = torch.clamp(entropy.detach(), min=-2.0, max=2.0)
+            
+            # Alpha loss with more stable formulation
+            alpha_loss = -(model.log_alpha * (entropy_detached - target_entropy)).mean()
+            
             optimizer_alpha.zero_grad()
             alpha_loss.backward()
-            torch.nn.utils.clip_grad_norm_([model.log_alpha], 0.5)
+            # Very conservative clipping for alpha
+            torch.nn.utils.clip_grad_norm_([model.log_alpha], 0.1)
             optimizer_alpha.step()
             
             # Clamp alpha parameter to prevent extreme values
             with torch.no_grad():
-                torch.clamp_(model.log_alpha, min=-2.0, max=3.0)  # Narrower range
+                torch.clamp_(model.log_alpha, min=-5.0, max=2.0)
 
             # --- Target Update ---
             model.update_targets(tau)
