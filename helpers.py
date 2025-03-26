@@ -85,17 +85,26 @@ class SACCQL(nn.Module):
         # Add entropy temperature parameter with higher initialization
         self.log_alpha = torch.nn.Parameter(torch.tensor([2.0], requires_grad=True))
 
-        # Stochastic Actor (Gaussian policy)
+        # Improved Stochastic Actor (Gaussian policy)
         self.actor = nn.Sequential(
-            nn.Linear(8, 256),
-            nn.LayerNorm(256),  # Added for stability
-            nn.ReLU(),
-            nn.Dropout(0.1),  # Added dropout to prevent overfitting
+            nn.Linear(8, 512),
+            nn.BatchNorm1d(512),
+            nn.SiLU(),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.SiLU(),
             nn.Linear(256, 256),
             nn.LayerNorm(256),
-            nn.ReLU(),
-            nn.Dropout(0.1),  # Added dropout
+            nn.Dropout(0.2),
         )
+        
+        # Advantage estimation head
+        self.adv_head = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.SiLU(),
+            nn.Linear(128, 1)
+        )
+        
         self.mean = nn.Linear(256, 2)
         self.log_std = nn.Linear(256, 2)
         # Initialize with larger weights for better exploration
@@ -201,7 +210,7 @@ def debug_tensor(tensor, name="", check_grad=False, threshold=1e6):
 
 def compute_cql_penalty(states, dataset_actions, model, num_action_samples=10):
     """
-    Fixed CQL penalty calculation
+    Adaptive CQL penalty calculation with gradient regularization
     Args:
         states: Current states from batch (batch_size, state_dim)
         dataset_actions: Actions taken in the dataset (batch_size, action_dim)
@@ -241,9 +250,13 @@ def compute_cql_penalty(states, dataset_actions, model, num_action_samples=10):
     
     cql_penalty = (logsumexp_q1 + logsumexp_q2 - 2 * dataset_q_mean)
     
+    # Adaptive CQL weight based on Q-value spread
+    q_spread = torch.std(q1_all) + torch.std(q2_all)
+    adaptive_factor = 1.0 + torch.tanh(q_spread/5.0)
+    
     # Dynamic margin based on Q-values
     margin = torch.clamp(5.0 / (torch.abs(dataset_q_mean) + 1e-6), 0.1, 10.0)
-    return torch.clamp(cql_penalty, min=-margin, max=margin)  # Clamping to prevent Q-value collapse
+    return torch.clamp(cql_penalty * adaptive_factor, min=-margin, max=margin)
 
 def train_offline(dataset_path, model, csv_file='training_stats.csv', 
                  epochs=1000, batch_size=256, print_interval=100,
@@ -254,15 +267,36 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     model = model.to(device)
     
-    # Optimizers
-    optimizer_actor = optim.Adam(model.actor.parameters(), lr=3e-4)
+    # Optimizers with different learning rates
+    optimizer_actor = optim.Adam(
+        list(model.actor.parameters()) + 
+        list(model.mean.parameters()) + 
+        list(model.log_std.parameters()) +
+        list(model.adv_head.parameters()), 
+        lr=3e-4
+    )
     optimizer_critic = optim.Adam(
         list(model.q1.parameters()) + list(model.q2.parameters()), 
-        lr=3e-4,
-        weight_decay=1e-4  # Added weight decay
+        lr=1e-4,  # Reduced from 3e-4
+        weight_decay=1e-4
     )
-    optimizer_alpha = optim.Adam([model.log_alpha], lr=1e-4)  # Increased from 3e-5 for better adaptation
-    target_entropy = -torch.tensor(action_dim).to(device)  # Target entropy = -action_dim
+    optimizer_alpha = optim.Adam([model.log_alpha], lr=1e-4)
+    
+    # Learning rate schedulers
+    scheduler_critic = optim.lr_scheduler.OneCycleLR(
+        optimizer_critic, 
+        max_lr=1e-4,
+        total_steps=epochs*len(dataloader),
+        pct_start=0.3,
+        anneal_strategy='cos'
+    )
+    scheduler_actor = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer_actor,
+        T_max=10*len(dataloader)
+    )
+    
+    # Increased target entropy for better exploration
+    target_entropy = -torch.tensor(action_dim * 2.0).to(device)
     
     # Logging
     writer = SummaryWriter()
@@ -326,31 +360,49 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
             y_t = torch.tanh(x_t)
             pred_actions = y_t * model.action_scale
             
+            # Policy smoothing regularization
+            noise = torch.randn_like(pred_actions) * 0.1
+            smooth_actions = torch.clamp(pred_actions + noise, -model.action_scale, model.action_scale)
+            
             log_probs = normal.log_prob(x_t).sum(1)
             log_probs -= torch.log(1 - y_t.pow(2) + 1e-6).sum(1)
-            entropy = log_probs.mean()  # Removed negative sign to fix entropy calculation
+            entropy = log_probs.mean()
             
             # Add entropy regularization scaling
             entropy_scale = torch.clamp(1.0 / (entropy.detach() + 1e-6), 0.1, 10.0)
 
+            # Compute advantage using the advantage head
+            adv_value = model.adv_head(model.actor(states)).squeeze()
+            
             q1_pred = model.q1(torch.cat([states, pred_actions], 1))
             q2_pred = model.q2(torch.cat([states, pred_actions], 1))
-            actor_loss = -torch.min(q1_pred, q2_pred).mean() * 0.5 + alpha * entropy * entropy_scale
+            q1_smooth = model.q1(torch.cat([states, smooth_actions], 1))
+            q2_smooth = model.q2(torch.cat([states, smooth_actions], 1))
+            
+            # Add policy smoothing penalty
+            smooth_penalty = F.mse_loss(q1_pred, q1_smooth) + F.mse_loss(q2_pred, q2_smooth)
+            
+            # Combine losses with advantage guidance
+            actor_loss = -torch.min(q1_pred, q2_pred).mean() * 0.5 + alpha * entropy * entropy_scale + 0.1 * smooth_penalty - 0.01 * adv_value.mean()
 
             optimizer_actor.zero_grad()
             actor_loss.backward()
             actor_grad_norm = torch.nn.utils.clip_grad_norm_(model.actor.parameters(), 0.5).item()
             optimizer_actor.step()
             
-            # Alpha optimization
-            alpha_loss = -(model.log_alpha * (entropy - target_entropy).detach()).mean()
+            # Alpha optimization with entropy momentum
+            alpha_loss = -(model.log_alpha * (0.9*entropy + 0.1*entropy.detach() - target_entropy)).mean()
             optimizer_alpha.zero_grad()
             alpha_loss.backward()
-            torch.nn.utils.clip_grad_norm_([model.log_alpha], 0.5)  # Increased clipping threshold
+            torch.nn.utils.clip_grad_norm_([model.log_alpha], 0.5)
             optimizer_alpha.step()
 
             # --- Target Update ---
             model.update_targets(tau)
+            
+            # Update learning rate schedulers
+            scheduler_critic.step()
+            scheduler_actor.step()
 
             # --- Metrics ---
             metrics['td'] += td_loss.item()

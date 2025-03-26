@@ -6,11 +6,11 @@ if __name__ == "__main__":
         "dataset_path": "datasets/processed/563-train.csv",
         "csv_file": "training_stats.csv",
         "epochs": 60,
-        "batch_size": 512,  # Increased from 256
+        "batch_size": 512,
         "device": device,
-        "cql_weight": 0.1,  # Adjusted for better balance between TD and CQL objectives
+        "cql_weight": 0.05,  # Further reduced to prevent Q-value collapse
         "alpha": 0.2,
-        "tau": 0.005  # Reduced from 0.01 for slower target updates
+        "tau": 0.005
     }
 
     # Initialize and train
