@@ -88,14 +88,14 @@ class SACCQL(nn.Module):
         # Improved Stochastic Actor (Gaussian policy)
         self.actor = nn.Sequential(
             nn.Linear(8, 512),
-            nn.BatchNorm1d(512),
+            nn.LayerNorm(512),  # Changed from BatchNorm for more stability
             nn.SiLU(),
             nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
+            nn.LayerNorm(256),  # Changed from BatchNorm
             nn.SiLU(),
             nn.Linear(256, 256),
             nn.LayerNorm(256),
-            nn.Dropout(0.2),
+            nn.Dropout(0.1),  # Reduced dropout rate
         )
         
         # Advantage estimation head
@@ -114,13 +114,13 @@ class SACCQL(nn.Module):
         # Twin Critics with CQL
         def create_q():
             return nn.Sequential(
-                nn.Linear(10, 256),
-                nn.LayerNorm(256),
-                nn.ReLU(),
-                nn.Linear(256, 256),
-                nn.LayerNorm(256),
-                nn.ReLU(),
-                nn.Linear(256, 1)
+                nn.Linear(10, 512),
+                nn.LayerNorm(512),
+                nn.SiLU(),  # Changed from ReLU
+                nn.Linear(512, 512),  # Deeper network
+                nn.LayerNorm(512),
+                nn.SiLU(),  # Changed from ReLU
+                nn.Linear(512, 1)
             )
         
         self.q1 = create_q()
@@ -208,13 +208,14 @@ def debug_tensor(tensor, name="", check_grad=False, threshold=1e6):
         if torch.isinf(grad).any():
             print(f"❌ Infs in gradient of {name}")
 
-def compute_cql_penalty(states, dataset_actions, model, num_action_samples=10):
+def compute_cql_penalty(states, dataset_actions, model, num_action_samples=10, global_step=0):
     """
     Adaptive CQL penalty calculation with gradient regularization
     Args:
         states: Current states from batch (batch_size, state_dim)
         dataset_actions: Actions taken in the dataset (batch_size, action_dim)
         model: Reference to the agent's networks
+        global_step: Current training step for dynamic margin adjustment
     """
     batch_size = states.shape[0]
     
@@ -254,13 +255,18 @@ def compute_cql_penalty(states, dataset_actions, model, num_action_samples=10):
     q_spread = torch.std(q1_all) + torch.std(q2_all)
     adaptive_factor = 1.0 + torch.tanh(q_spread/5.0)
     
-    # Dynamic margin based on Q-values
-    margin = torch.clamp(5.0 / (torch.abs(dataset_q_mean) + 1e-6), 0.1, 10.0)
-    return torch.clamp(cql_penalty * adaptive_factor, min=-margin, max=margin)
+    # New dynamic margin based on training progress
+    progress = min(global_step / 1e5, 1.0)  # Assuming 100k step training
+    margin = 5.0 * (1 - 0.9*progress)  # Decaying margin
+    
+    # Add gradient regularization to prevent Q-value collapse
+    q_penalty = torch.clamp(cql_penalty * adaptive_factor, min=-margin, max=margin)
+    
+    return q_penalty
 
 def train_offline(dataset_path, model, csv_file='training_stats.csv', 
                  epochs=1000, batch_size=256, print_interval=100,
-                 device="cuda", alpha=0.2, cql_weight=0.25, tau=0.005):
+                 device="cuda", alpha=0.2, cql_weight=0.25, tau=0.01):  # Increased tau from 0.005 to 0.01
     """Main training loop for offline CQL-based SAC."""
     # Dataset setup
     dataset = DiabetesDataset(csv_file=dataset_path)
@@ -295,8 +301,8 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
         T_max=10*len(dataloader)
     )
     
-    # Increased target entropy for better exploration
-    target_entropy = -torch.tensor(action_dim * 2.0).to(device)
+    # Adjusted target entropy for better exploration-exploitation balance
+    target_entropy = -torch.tensor(action_dim * 1.5).to(device)  # Changed from 2.0
     
     # Logging
     writer = SummaryWriter()
@@ -339,7 +345,7 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
             current_q2 = model.q2(torch.cat([states, dataset_actions], 1))
             
             td_loss = F.smooth_l1_loss(current_q1, target_q) + F.smooth_l1_loss(current_q2, target_q)
-            cql_penalty = compute_cql_penalty(states, dataset_actions, model)
+            cql_penalty = compute_cql_penalty(states, dataset_actions, model, global_step=global_step)
             # Apply cql_weight here instead of in the compute_cql_penalty function
             critic_loss = td_loss + cql_weight * cql_penalty
 
@@ -396,6 +402,10 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
             alpha_loss.backward()
             torch.nn.utils.clip_grad_norm_([model.log_alpha], 0.5)
             optimizer_alpha.step()
+            
+            # Clamp alpha parameter to prevent extreme values
+            with torch.no_grad():
+                torch.clamp_(model.log_alpha, min=-4.0, max=5.0)
 
             # --- Target Update ---
             model.update_targets(tau)

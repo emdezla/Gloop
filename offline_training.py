@@ -8,9 +8,9 @@ if __name__ == "__main__":
         "epochs": 60,
         "batch_size": 512,
         "device": device,
-        "cql_weight": 0.05,  # Further reduced to prevent Q-value collapse
+        "cql_weight": 0.03,  # Further reduced from 0.05 to prevent Q-value collapse
         "alpha": 0.2,
-        "tau": 0.005
+        "tau": 0.01  # Increased from 0.005 for faster target updates
     }
 
     # Initialize and train
