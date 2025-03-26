@@ -38,6 +38,10 @@ class DiabetesDataset(Dataset):
 
         # Extract action features (2 dimensions)
         self.actions = self.df[["basal", "bolus"]].values.astype(np.float32)
+        
+        # Add action normalization to match tanh output range
+        self.actions = (self.actions - self.actions.mean(0)) / (self.actions.std(0) + 1e-6)
+        self.actions = np.clip(self.actions, -1.0, 1.0)  # Match tanh output
 
         # Extract done flags
         self.dones = self.df["done"].values.astype(np.float32)
@@ -89,27 +93,26 @@ class SACCQL(nn.Module):
         # Improved Stochastic Actor (Gaussian policy)
         self.actor = nn.Sequential(
             nn.Linear(8, 512),
-            nn.LayerNorm(512),  # Changed from BatchNorm for more stability
-            nn.SiLU(),
+            nn.BatchNorm1d(512),  # More stable than LayerNorm for gradient flow
+            nn.LeakyReLU(0.1),
             nn.Linear(512, 256),
-            nn.LayerNorm(256),  # Changed from BatchNorm
-            nn.SiLU(),
+            nn.BatchNorm1d(256),
+            nn.LeakyReLU(0.1),
             nn.Linear(256, 256),
-            nn.LayerNorm(256),
             nn.Dropout(0.1),  # Reduced dropout rate
         )
         
         # Advantage estimation head
         self.adv_head = nn.Sequential(
             nn.Linear(256, 128),
-            nn.SiLU(),
+            nn.LeakyReLU(0.1),
             nn.Linear(128, 1)
         )
         
         self.mean = nn.Linear(256, 2)
         self.log_std = nn.Linear(256, 2)
-        # Initialize with larger weights for better exploration
-        nn.init.uniform_(self.mean.weight, -0.1, 0.1)
+        # Orthogonal initialization for better exploration
+        nn.init.orthogonal_(self.mean.weight, gain=0.01)
         nn.init.constant_(self.log_std.weight, -1.0)  # Safer initialization
 
         # Twin Critics with CQL - Revised architecture for better gradient flow
@@ -251,12 +254,11 @@ def compute_cql_penalty(states, dataset_actions, model, num_action_samples=10, g
     cql_penalty = (logsumexp_q1 + logsumexp_q2 - 2 * dataset_q_mean)
     
     # Adaptive CQL weight based on Q-value spread - less aggressive scaling
-    q_spread = torch.std(q1_all) + torch.std(q2_all)
-    adaptive_factor = 1.0 + 0.5*torch.tanh(q_spread/3.0)
+    q_std = 0.5 * (torch.std(q1_all) + torch.std(q2_all)) + 1e-6
+    adaptive_factor = 1.0 + 0.5 * torch.tanh(q_std/3.0)
     
-    # New dynamic margin based on training progress - faster decay
-    progress = min(global_step / (epochs * dataloader_len), 1.0)  # 0→1 scale
-    margin = 2.0 * (1 - 0.98*progress)  # Start at 2.0, decay to 0.04
+    # Dynamic margin based on Q-value standard deviation
+    margin = torch.clamp(3.0 * q_std, min=0.1, max=5.0)
     
     # Add gradient regularization to prevent Q-value collapse
     q_penalty = torch.clamp(cql_penalty * adaptive_factor, min=-margin, max=margin)
@@ -278,11 +280,11 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
         list(model.mean.parameters()) + 
         list(model.log_std.parameters()) +
         list(model.adv_head.parameters()), 
-        lr=3e-4
+        lr=1e-4  # Reduced learning rate for actor
     )
     optimizer_critic = optim.Adam(
         list(model.q1.parameters()) + list(model.q2.parameters()), 
-        lr=1e-4,  # Reduced from 3e-4
+        lr=3e-4,  # Increased from 1e-4
         weight_decay=1e-4
     )
     optimizer_alpha = optim.Adam([model.log_alpha], lr=1e-4)
@@ -290,7 +292,7 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
     # Learning rate schedulers
     scheduler_critic = optim.lr_scheduler.OneCycleLR(
         optimizer_critic, 
-        max_lr=1e-4,
+        max_lr=3e-4,
         total_steps=epochs*len(dataloader),
         pct_start=0.3,
         anneal_strategy='cos'
@@ -301,7 +303,7 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
     )
     
     # Adjusted target entropy for better exploration-exploitation balance
-    target_entropy = -torch.tensor(action_dim * 0.8).to(device)  # Reduced from 1.5 to prevent entropy collapse
+    target_entropy = torch.tensor(0.5 * action_dim).to(device)  # Positive value to encourage exploration
     
     # Logging
     writer = SummaryWriter()
@@ -374,8 +376,10 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
             
             log_probs = normal.log_prob(x_t).sum(1)
             log_probs -= torch.log(1 - y_t.pow(2) + 1e-6).sum(1)
-            # Shift entropy to positive range to prevent entropy collapse
-            entropy = torch.clamp(log_probs.mean() + 2.0, min=0.1, max=2.0)
+            # Proper entropy calculation (negative log prob)
+            entropy = -log_probs.mean()
+            # Reasonable bounds for entropy
+            entropy = torch.clamp(entropy, min=0.1, max=2.0)
             
             # Add entropy regularization scaling
             entropy_scale = torch.clamp(1.0 / (entropy.detach() + 1e-6), 0.1, 10.0)
@@ -409,7 +413,7 @@ def train_offline(dataset_path, model, csv_file='training_stats.csv',
             
             # Clamp alpha parameter to prevent extreme values
             with torch.no_grad():
-                torch.clamp_(model.log_alpha, min=-4.0, max=5.0)
+                torch.clamp_(model.log_alpha, min=-2.0, max=3.0)  # Narrower range
 
             # --- Target Update ---
             model.update_targets(tau)

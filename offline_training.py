@@ -5,12 +5,12 @@ if __name__ == "__main__":
     config = {
         "dataset_path": "datasets/processed/563-train.csv",
         "csv_file": "training_stats.csv",
-        "epochs": 150,  # Increased for longer training
-        "batch_size": 1024,  # Larger batches to reduce variance
+        "epochs": 200,  # Increased for longer training
+        "batch_size": 2048,  # Larger batches to reduce variance
         "device": device,
-        "cql_weight": 0.015,  # Further reduced to prevent Q-value collapse
+        "cql_weight": 0.008,  # Further reduced to prevent Q-value collapse
         "alpha": 0.2,
-        "tau": 0.03  # Increased for faster target updates
+        "tau": 0.05  # Increased for faster target updates
     }
 
     # Initialize and train
