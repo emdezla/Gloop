@@ -1,5 +1,6 @@
 from helpers import *
 from basic_offline_training import SimpleSAC, train_basic
+from SAC_training import SACAgent, train_sac_offline
 
 if __name__ == "__main__":
     # Configuration for original complex model
@@ -20,6 +21,15 @@ if __name__ == "__main__":
         "csv_file": "simple_training_stats.csv",
         "epochs": 100,
         "batch_size": 256,
+        "device": device
+    }
+    
+    # Configuration for LSTM-based SAC model
+    lstm_sac_config = {
+        "dataset_path": "datasets/processed/563-train.csv",
+        "epochs": 1000,
+        "batch_size": 256,
+        "save_path": "lstm_sac_final.pth",
         "device": device
     }
 
@@ -50,4 +60,17 @@ if __name__ == "__main__":
         tau=complex_config["tau"]
     )
     torch.save(trained_complex_model.state_dict(), "sac_cql_final.pth")
+    """
+    
+    # Option 3: Train the LSTM-based SAC model
+    """
+    print("Training LSTM-based SAC model...")
+    trained_lstm_sac = train_sac_offline(
+        dataset_path=lstm_sac_config["dataset_path"],
+        epochs=lstm_sac_config["epochs"],
+        batch_size=lstm_sac_config["batch_size"],
+        save_path=os.path.splitext(lstm_sac_config["save_path"])[0]
+    )
+    trained_lstm_sac.save(lstm_sac_config["save_path"])
+    print(f"LSTM SAC model saved to {lstm_sac_config['save_path']}")
     """
