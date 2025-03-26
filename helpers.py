@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 import torch.nn as nn
 import torch.optim as optim
 import os
@@ -11,6 +11,7 @@ from datetime import datetime
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm  # For progress bar
+from collections import defaultdict
 
 
 
@@ -235,3 +236,127 @@ def compute_cql_penalty(states, dataset_actions, model, num_action_samples=10):
     dataset_q_mean = 0.5 * (q1_data.mean() + q2_data.mean())
     
     return logsumexp - dataset_q_mean
+
+def train_offline(dataset_path, model, csv_file='training_stats.csv', 
+                 epochs=1000, batch_size=256, print_interval=100,
+                 device="cuda", alpha=0.2, cql_weight=0.25, tau=0.005):
+    """Main training loop for offline CQL-based SAC."""
+    # Dataset setup
+    dataset = DiabetesDataset(csv_file=dataset_path)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    model = model.to(device)
+    
+    # Optimizers
+    optimizer_actor = optim.Adam(model.actor.parameters(), lr=3e-4)
+    optimizer_critic = optim.Adam(
+        list(model.q1.parameters()) + list(model.q2.parameters()), lr=3e-4
+    )
+    
+    # Logging
+    writer = SummaryWriter()
+    torch.autograd.set_detect_anomaly(False)  # Disable for performance
+    
+    # Initialize CSV
+    with open(csv_file, 'w', newline='') as f:
+        csv_writer = csv.writer(f)
+        csv_writer.writerow(['Epoch', 'Iteration', 'TD Loss', 'CQL Penalty', 
+                           'Critic Loss', 'Actor Loss', 'Q1 Value', 'Q2 Value',
+                           'Action_Mean', 'Action_Std', 'Entropy'])
+
+    # Training loop
+    global_step = 0
+    for epoch in tqdm(range(epochs), desc="Training"):
+        metrics = defaultdict(float)
+        batch_count = 0
+        
+        for i, batch in enumerate(dataloader):
+            # Device transfer
+            states = batch["state"].to(device)
+            dataset_actions = batch["action"].to(device)
+            rewards = batch["reward"].to(device).unsqueeze(1)
+            next_states = batch["next_state"].to(device)
+            dones = batch["done"].to(device).unsqueeze(1)
+
+            # --- Critic Update ---
+            with torch.no_grad():
+                next_mean, next_log_std = model(next_states)
+                next_std = next_log_std.exp()
+                next_normal = torch.distributions.Normal(next_mean, next_std)
+                next_actions = torch.tanh(next_normal.rsample()) * model.action_scale
+                
+                q1_next = model.q1_target(torch.cat([next_states, next_actions], 1))
+                q2_next = model.q2_target(torch.cat([next_states, next_actions], 1))
+                target_q = rewards + (1 - dones) * 0.99 * torch.min(q1_next, q2_next)
+
+            current_q1 = model.q1(torch.cat([states, dataset_actions], 1))
+            current_q2 = model.q2(torch.cat([states, dataset_actions], 1))
+            
+            td_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
+            cql_penalty = compute_cql_penalty(states, dataset_actions, model)
+            critic_loss = td_loss + cql_weight * cql_penalty
+
+            optimizer_critic.zero_grad()
+            critic_loss.backward()
+            optimizer_critic.step()
+
+            # --- Actor Update ---
+            mean, log_std = model(states)
+            std = log_std.exp()
+            normal = torch.distributions.Normal(mean, std)
+            x_t = normal.rsample()
+            y_t = torch.tanh(x_t)
+            pred_actions = y_t * model.action_scale
+            
+            log_probs = normal.log_prob(x_t).sum(1)
+            log_probs -= torch.log(1 - y_t.pow(2) + 1e-6).sum(1)
+            entropy = -log_probs.mean()
+
+            q1_pred = model.q1(torch.cat([states, pred_actions], 1))
+            q2_pred = model.q2(torch.cat([states, pred_actions], 1))
+            actor_loss = -torch.min(q1_pred, q2_pred).mean() + alpha * entropy
+
+            optimizer_actor.zero_grad()
+            actor_loss.backward()
+            optimizer_actor.step()
+
+            # --- Target Update ---
+            model.update_targets(tau)
+
+            # --- Metrics ---
+            metrics['td'] += td_loss.item()
+            metrics['cql'] += cql_penalty.item()
+            metrics['critic'] += critic_loss.item()
+            metrics['actor'] += actor_loss.item()
+            metrics['q1'] += q1_pred.mean().item()
+            metrics['q2'] += q2_pred.mean().item()
+            metrics['action_mean'] += pred_actions.mean().item()
+            metrics['action_std'] += pred_actions.std().item()
+            metrics['entropy'] += entropy.item()
+            batch_count += 1
+            global_step += 1
+
+            # --- Logging ---
+            if i % print_interval == 0 and batch_count > 0:
+                avg_metrics = {k: v/batch_count for k, v in metrics.items()}
+                
+                # TensorBoard
+                for key, value in avg_metrics.items():
+                    writer.add_scalar(f'{key.capitalize()}', value, global_step)
+                
+                # CSV
+                with open(csv_file, 'a', newline='') as f:
+                    csv_writer = csv.writer(f)
+                    csv_writer.writerow([
+                        epoch, i,
+                        avg_metrics['td'], avg_metrics['cql'],
+                        avg_metrics['critic'], avg_metrics['actor'],
+                        avg_metrics['q1'], avg_metrics['q2'],
+                        avg_metrics['action_mean'], avg_metrics['action_std'],
+                        avg_metrics['entropy']
+                    ])
+                
+                metrics = defaultdict(float)
+                batch_count = 0
+
+    writer.close()
+    return model
