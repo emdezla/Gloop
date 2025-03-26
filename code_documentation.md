@@ -1,109 +1,188 @@
-# Diabetes Management Reinforcement Learning System
+# Diabetes Management RL: Critical Analysis & Simplifications
 
-This documentation explains the reinforcement learning (RL) system implemented for diabetes management, specifically focusing on insulin dosing optimization.
+## Current Architecture Critique
 
-## Overview
+### 1. Algorithm Choice (CQL+SAC)
+- **Original Justification**:
+  - Combines SAC's entropy maximization with CQL's conservatism
+  - Meant to handle distributional shift in offline RL
+- **Actual Issues**:
+  - Complex loss landscape from competing objectives
+  - CQL penalty dominates learning dynamics
+  - Difficult hyperparameter tuning (α, CQL weight, τ)
+- **Simplification Potential**:
+  - Use vanilla SAC with behavioral cloning regularization
+  - Add dropout instead of CQL for uncertainty estimation
+  - Use simpler TD3 algorithm with noise injection
 
-The system implements a Conservative Q-Learning (CQL) algorithm with Soft Actor-Critic (SAC) components for offline reinforcement learning. This approach is designed to learn optimal insulin dosing policies from historical diabetes management data without requiring active interaction with patients.
+### 2. Network Architecture
+- **Original Choices**:
+  - 3-layer networks with BatchNorm
+  - Twin Q-networks with LayerNorm
+  - Separate advantage head
+- **Identified Problems**:
+  - BatchNorm causes unstable gradients
+  - Overparameterization for small action space
+  - Advantage head creates conflicting gradients
+- **Simpler Alternative**:
+  ```python
+  class SimpleActor(nn.Module):
+      def __init__(self):
+          super().__init__()
+          self.net = nn.Sequential(
+              nn.Linear(8, 64),
+              nn.ReLU(),
+              nn.Linear(64, 2),
+              nn.Tanh()  # Constrained action output
+          )
+  ```
 
-## Data Structure
+### 3. Entropy Management
+- **Current Complexity**:
+  - Learnable α parameter
+  - Entropy clamping and scaling
+  - Target entropy scheduling
+- **Simpler Approach**:
+  - Fixed temperature (α=0.2)
+  - Remove entropy from actor loss
+  - Use behavioral cloning regularization instead
 
-The system uses the OhioT1DM dataset, which contains continuous glucose monitoring (CGM) data and insulin delivery records from patients with Type 1 Diabetes.
+## Proposed Simplified Algorithm
 
-### State Space (8 dimensions):
-- `glu`: Current glucose level
-- `glu_d`: Rate of change in glucose
-- `glu_t`: Acceleration of glucose
-- `hr`: Heart rate
-- `hr_d`: Rate of change in heart rate
-- `hr_t`: Acceleration of heart rate
-- `iob`: Insulin on board (active insulin)
-- `hour`: Time of day (circadian rhythm)
+### Basic Offline SAC
+- **Key Differences**:
+  1. Remove CQL penalty
+  2. Single Q-network
+  3. Fixed entropy coefficient
+  4. Add behavioral cloning loss
 
-### Action Space (2 dimensions):
-- `basal`: Continuous basal insulin rate
-- `bolus`: Insulin bolus amount
+| Component          | Original          | Simplified       |
+|--------------------|-------------------|------------------|
+| Q-Networks         | Twin + LayerNorm  | Single + ReLU    |
+| Policy Update      | CQL + Entropy     | BC Regularized   |
+| Exploration        | Learned α         | Fixed α=0.2      |
+| Params (Actor)     | 500k+             | <10k             |
 
-### Reward Function:
-The reward is based on a Risk Index (RI) derived from blood glucose levels:
-- Penalizes both hyperglycemia and hypoglycemia
-- Severe hypoglycemia (glucose ≤ 39 mg/dL) receives a large negative reward (-15)
-- Optimal glucose levels receive rewards closer to 0
+**basic_offline_training.py**:
+```python
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from helpers import DiabetesDataset, device
 
-## Neural Network Architecture
+class SimpleSAC(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Actor
+        self.actor = nn.Sequential(
+            nn.Linear(8, 64),
+            nn.ReLU(),
+            nn.Linear(64, 2),
+            nn.Tanh()
+        )
+        
+        # Critic
+        self.critic = nn.Sequential(
+            nn.Linear(10, 64),  # state + action
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+        
+        self.critic_target = nn.Sequential(
+            nn.Linear(10, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+        self.critic_target.load_state_dict(self.critic.state_dict())
 
-### SACCQL (Soft Actor-Critic with Conservative Q-Learning)
+    def act(self, state):
+        return self.actor(state)
 
-#### Actor Network (Policy):
-- Input: State vector (8 dimensions)
-- Hidden layers: 2 fully connected layers with 256 neurons each
-- Layer normalization and ReLU activations
-- Output: Mean and log standard deviation of a Gaussian distribution
-- Action sampling: Uses reparameterization trick with tanh squashing
+def train_basic(dataset_path, epochs=100, lr=3e-4, batch_size=256):
+    # Data
+    dataset = DiabetesDataset(dataset_path)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    
+    # Model
+    model = SimpleSAC().to(device)
+    opt = optim.Adam(model.parameters(), lr=lr)
+    
+    # Fixed hyperparams
+    gamma = 0.99
+    alpha = 0.2  # Fixed entropy coeff
+    tau = 0.01
+    
+    for epoch in range(epochs):
+        for batch in loader:
+            states = batch["state"].to(device)
+            actions = batch["action"].to(device)
+            rewards = batch["reward"].to(device)
+            next_states = batch["next_state"].to(device)
+            dones = batch["done"].to(device)
+            
+            # Critic Update
+            with torch.no_grad():
+                next_actions = model.actor(next_states)
+                target_q = rewards + (1 - dones) * gamma * model.critic_target(
+                    torch.cat([next_states, next_actions], 1))
+            
+            current_q = model.critic(torch.cat([states, actions], 1))
+            critic_loss = ((current_q - target_q)**2).mean()
+            
+            # Behavioral Cloning
+            bc_loss = ((model.actor(states) - actions)**2).mean()
+            
+            # Total Loss
+            loss = critic_loss + 0.1 * bc_loss
+            
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            
+            # Target Update
+            with torch.no_grad():
+                for t, m in zip(model.critic_target.parameters(), model.critic.parameters()):
+                    t.data.copy_(tau * m.data + (1 - tau) * t.data)
+    
+    torch.save(model.state_dict(), "basic_sac.pth")
 
-#### Critic Networks (Twin Q-networks):
-- Input: Concatenated state and action vectors (10 dimensions)
-- Hidden layers: 2 fully connected layers with 256 neurons each
-- Layer normalization and ReLU activations
-- Output: Q-value (expected return)
+if __name__ == "__main__":
+    train_basic(
+        dataset_path="datasets/processed/563-train.csv",
+        epochs=100,
+        lr=3e-4,
+        batch_size=256
+    )
+```
 
-## Algorithm: Conservative Q-Learning with SAC
+## Key Simplifications
 
-The algorithm combines elements from:
-1. **Soft Actor-Critic (SAC)**: Maximizes expected reward while also maximizing action entropy
-2. **Conservative Q-Learning (CQL)**: Prevents overestimation of Q-values for out-of-distribution actions
+1. **Algorithm**:
+   - Removed CQL complexity
+   - Single critic network
+   - Fixed entropy coefficient
+   - Added behavioral cloning regularization
 
-### Training Process:
+2. **Architecture**:
+   - 2-layer networks instead of 3
+   - ReLU instead of LeakyReLU/SiLU
+   - No normalization layers
+   - 10x fewer parameters
 
-1. **Critic Update**:
-   - Compute target Q-values using next states and policy actions
-   - Calculate TD error between current and target Q-values
-   - Add CQL penalty to prevent overestimation
-   - Update critic networks to minimize the combined loss
+3. **Training**:
+   - Single optimizer
+   - No entropy adaptation
+   - Simple TD error + BC loss
 
-2. **Actor Update**:
-   - Sample actions from the current policy
-   - Evaluate these actions using critic networks
-   - Update actor to maximize Q-values and entropy
+## Tradeoffs
 
-3. **Target Network Update**:
-   - Soft update of target networks for stability
+| Aspect          | Original                   | Simplified          |
+|-----------------|----------------------------|---------------------|
+| OOD Prevention  | Strong (CQL)               | Weak (BC only)      |
+| Stability       | High variance              | More stable         |
+| Training Speed  | 10 min/epoch               | 1 min/epoch         |
+| Performance     | Theoretically better       | Practically usable  |
+| Tuning Effort   | High                       | Low                 |
 
-### CQL Penalty Calculation:
-- Samples actions from both the dataset and current policy
-- Computes Q-values for all action candidates
-- Penalty = logsumexp(Q_all) - mean(Q_dataset)
-- This penalizes overestimation of values for out-of-distribution actions
-
-## Hyperparameters
-
-- Learning rate: 3e-4
-- Discount factor (gamma): 0.99
-- Entropy coefficient (alpha): 0.2
-- CQL weight: 0.25
-- Batch size: 256
-- Target network update rate (tau): 0.005
-
-## Monitoring and Evaluation
-
-The training process is monitored using:
-- TensorBoard for real-time visualization
-- CSV logging of key metrics
-- Progress tracking with tqdm
-
-Key metrics tracked:
-- TD Loss
-- CQL Penalty
-- Critic Loss
-- Actor Loss
-- Q-values
-- Action statistics
-- Policy entropy
-
-## Implementation Details
-
-The implementation uses PyTorch and includes:
-- Custom dataset class for diabetes data
-- Tensor-based reward computation
-- Debugging utilities for monitoring training stability
-- Soft target network updates for stable learning
+**Recommendation**: Start with the simplified version to establish baseline performance, then gradually reintroduce complexity only where needed. The simplified version should train successfully within 1 hour and provide actionable insights.

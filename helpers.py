@@ -13,15 +13,10 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm  # For progress bar
 from collections import defaultdict
 
-
-
+# Global settings
 device = "cuda" if torch.cuda.is_available() else "cpu"
 state_dim = 8
 action_dim = 2  
-alpha = 0.2  
-cql_weight = 0.1  # Reduced from 0.25 to 0.1 for less conservative Q-values
-batch_size = 256
-
 
 class DiabetesDataset(Dataset):
     def __init__(self, csv_file):
@@ -48,7 +43,7 @@ class DiabetesDataset(Dataset):
 
         # Compute rewards based on glu_raw at t+1
         glucose_next_tensor = torch.tensor(self.df["glu_raw"].values, dtype=torch.float32)
-        self.rewards = compute_reward_torch(glucose_next_tensor) / 5.0  # Reduced normalization factor from 15.0
+        self.rewards = compute_reward_torch(glucose_next_tensor) / 5.0  # Reduced normalization factor
 
         # Compute next_states using vectorized roll
         self.next_states = np.roll(self.states, shift=-1, axis=0)
@@ -57,7 +52,6 @@ class DiabetesDataset(Dataset):
         self.next_states[self.dones == 1] = self.states[self.dones == 1]
 
         # Slice to make all arrays align: remove last step (no next state), and align reward with t
-
         self.states      = self.states[:-2]
         self.actions     = self.actions[:-2]
         self.rewards     = self.rewards[1:-1]
@@ -82,6 +76,56 @@ class DiabetesDataset(Dataset):
             "done":       self.dones[idx]
         }
 
+def compute_reward_torch(glucose_next):
+    """
+    Compute RI-based reward in PyTorch.
+    """
+    glucose_next = torch.clamp(glucose_next, min=1e-6)
+    log_term = torch.log(glucose_next) ** 1.084
+    f = 1.509 * (log_term - 5.381)
+    ri = 10 * f ** 2
+
+    reward = -torch.clamp(ri / 100.0, 0, 1)
+    reward[glucose_next <= 39.0] = -15.0
+    return reward
+
+def debug_tensor(tensor, name="", check_grad=False, threshold=1e6):
+    """
+    Prints diagnostic information about a tensor.
+    
+    Args:
+        tensor (torch.Tensor): The tensor to check.
+        name (str): Optional name for logging.
+        check_grad (bool): Also check gradients if available.
+        threshold (float): Warn if values exceed this.
+    """
+    try:
+        t_min = tensor.min().item()
+        t_max = tensor.max().item()
+        t_mean = tensor.mean().item()
+        t_std = tensor.std().item()
+    except Exception as e:
+        print(f"⚠️ Could not extract stats for {name}: {e}")
+        return
+
+    print(f"🧪 [{name}] Shape: {tuple(tensor.shape)} | min: {t_min:.4f}, max: {t_max:.4f}, mean: {t_mean:.4f}, std: {t_std:.4f}")
+
+    if torch.isnan(tensor).any():
+        print(f"❌ NaNs detected in {name}")
+    if torch.isinf(tensor).any():
+        print(f"❌ Infs detected in {name}")
+    if abs(t_min) > threshold or abs(t_max) > threshold:
+        print(f"⚠️ Extreme values detected in {name}: values exceed ±{threshold}")
+
+    if check_grad and tensor.requires_grad and tensor.grad is not None:
+        grad = tensor.grad
+        print(f"🔁 [{name}.grad] norm: {grad.norm().item():.4f}")
+        if torch.isnan(grad).any():
+            print(f"❌ NaNs in gradient of {name}")
+        if torch.isinf(grad).any():
+            print(f"❌ Infs in gradient of {name}")
+
+# Keep the original SACCQL class and train_offline function for comparison
 class SACCQL(nn.Module):
     def __init__(self): 
         super().__init__()
@@ -160,55 +204,6 @@ class SACCQL(nn.Module):
                 t.data.copy_(tau * m.data + (1 - tau) * t.data)
             for t, m in zip(self.q2_target.parameters(), self.q2.parameters()):
                 t.data.copy_(tau * m.data + (1 - tau) * t.data)
-
-def compute_reward_torch(glucose_next):
-    """
-    Compute RI-based reward in PyTorch.
-    """
-    glucose_next = torch.clamp(glucose_next, min=1e-6)
-    log_term = torch.log(glucose_next) ** 1.084
-    f = 1.509 * (log_term - 5.381)
-    ri = 10 * f ** 2
-
-    reward = -torch.clamp(ri / 100.0, 0, 1)
-    reward[glucose_next <= 39.0] = -15.0
-    return reward
-
-def debug_tensor(tensor, name="", check_grad=False, threshold=1e6):
-    """
-    Prints diagnostic information about a tensor.
-    
-    Args:
-        tensor (torch.Tensor): The tensor to check.
-        name (str): Optional name for logging.
-        check_grad (bool): Also check gradients if available.
-        threshold (float): Warn if values exceed this.
-    """
-    try:
-        t_min = tensor.min().item()
-        t_max = tensor.max().item()
-        t_mean = tensor.mean().item()
-        t_std = tensor.std().item()
-    except Exception as e:
-        print(f"⚠️ Could not extract stats for {name}: {e}")
-        return
-
-    print(f"🧪 [{name}] Shape: {tuple(tensor.shape)} | min: {t_min:.4f}, max: {t_max:.4f}, mean: {t_mean:.4f}, std: {t_std:.4f}")
-
-    if torch.isnan(tensor).any():
-        print(f"❌ NaNs detected in {name}")
-    if torch.isinf(tensor).any():
-        print(f"❌ Infs detected in {name}")
-    if abs(t_min) > threshold or abs(t_max) > threshold:
-        print(f"⚠️ Extreme values detected in {name}: values exceed ±{threshold}")
-
-    if check_grad and tensor.requires_grad and tensor.grad is not None:
-        grad = tensor.grad
-        print(f"🔁 [{name}.grad] norm: {grad.norm().item():.4f}")
-        if torch.isnan(grad).any():
-            print(f"❌ NaNs in gradient of {name}")
-        if torch.isinf(grad).any():
-            print(f"❌ Infs in gradient of {name}")
 
 def compute_cql_penalty(states, dataset_actions, model, num_action_samples=10, global_step=0, epochs=100, dataloader_len=100):
     """
