@@ -36,6 +36,7 @@ if __name__ == "__main__":
     # Choose which model to train (uncomment one)
     
     # Option 1: Train the simplified model (recommended first)
+    """
     print("Training simplified SAC model...")
     simple_model = train_basic(
         dataset_path=simple_config["dataset_path"],
@@ -43,9 +44,9 @@ if __name__ == "__main__":
         epochs=simple_config["epochs"],
         batch_size=simple_config["batch_size"]
     )
-    
-    # Option 2: Train the complex model (if needed)
     """
+    # Option 2: Train the complex model (if needed)
+
     print("Training complex SACCQL model...")
     complex_model = SACCQL()
     trained_complex_model = train_offline(
@@ -60,7 +61,7 @@ if __name__ == "__main__":
         tau=complex_config["tau"]
     )
     torch.save(trained_complex_model.state_dict(), "sac_cql_final.pth")
-    """
+
     
     # Option 3: Train the LSTM-based SAC model
     """
