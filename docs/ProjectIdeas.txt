@@ -1,0 +1,19 @@
+Gloop: Expanding the loop for automatic diabetes management.
+
+Abstract: 
+
+Introduction: We want to use aratificial intelligence to improve the curretn artificial pancreas systems that Type 1 diabetes people use. Most of them are physiological models such as the oref 1 or oref0 that do not improve over time. They are deterministic (they decide the insulin dose injection in fucntion of the glucose train and the macronutrients intake). However, this can be greatly improve using reinforcement learning to optimise the closed-loop so that we dont need to input the meal intake. We want to replace this with heart rate data because it would remove mental burden from the diabetic patioens (the heart data is autimatically tracked thanks to smart watches). By leveraging different time series data, we want to improve the reinforcment learning algorithm and potentially pair it with an LLM that could give reccomendations about the management of this chronic ilness. 
+
+Related work: Reinforcment learning has already been explored for artificial pancreas system both offline and online manner. Explain the different algorithms like SAC, PPO, GCPC, DDPG. No model has really explored how well do other data sources influence the performnace of the loop. 
+
+
+Problem statement: Explain the big problem described in the introduction that we are trying to solve mathematically but very briefly. Show how normal deterministic physiological artificial pancreas works and how are we trying to replace them with reinforcment learning. 
+
+Propose approach: Our idea is to first use offline reinforcenet learning to iobtain a relatively good general model (using past real data) and then we will train an online reinforcmenet agent (using a virtual simulator) to fine tune the moder for every person. 
+We are going to use SAC-CQL that has never been used for this application because... We compare a model containing CQL and a model without CQL. We also compare a model that has heart rate data compared with a model that doesnt have heart rate data and see which one of those works better. 
+
+Experimental methodology: The dataset is the OhioT1DM where 6 diabetic patients where and insulin pump, a glucose sensor and a health smartwatch for a month. We have an additional ten days per patient for testing. We preprocess the data into a dataset in the form of reinforcemnt learning (state, action, done). The action is based on the total insulin action (combining bolus and basal that are also included just for clarification). The states is glucose, glucose derivative, glucose trend, heart rate, heart rate derivative, heart rate trend, insulin on board and hour of the day (all observations are normalised but we also include raw glucose data for). There is a datapoint every 5 min and data is aligned choosing the closest datapoint in their 5 min veccinity. 
+
+Results and discussion: Be as detailed as possible 
+
+Next steps and new research ideas: The next step is the fine tuning this model using online reinforcment learning. We also want to include LLM pairing of our reinforcment learning to give reccomendations to the patients.
