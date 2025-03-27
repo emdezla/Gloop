@@ -139,34 +139,27 @@ class DiabetesDataset(Dataset):
 # --------------------------
 
 class SACAgent(nn.Module):
-    """Simplified SAC agent for diabetes management"""
+    """Simplified SAC Agent"""
     
-    def __init__(self, state_dim=8, action_dim=1):  # Changed action_dim to 1
+    def __init__(self, state_dim=8, action_dim=1):
         super().__init__()
         
-        # More stable actor with bounded outputs
+        # Actor Network
         self.actor = nn.Sequential(
             nn.Linear(state_dim, 128),
             nn.LayerNorm(128),
             nn.Tanh(),
             nn.Linear(128, 64),
             nn.LayerNorm(64),
-            nn.Tanh()
+            nn.Tanh(),
+            nn.Linear(64, action_dim)
         )
-        self.mean = nn.Linear(64, action_dim)
-        self.log_std = nn.Parameter(torch.zeros(1, action_dim))  # Start from neutral
-        self.log_alpha = nn.Parameter(torch.tensor([0.0]))  # Start from 0.0 instead of 1.0
-        self.target_entropy = -action_dim  # Should be -1 for 1D action
-        self.action_scale = 1.0  # Fixed, no longer a learnable parameter
         
         # Initialize weights properly
         for layer in self.actor:
             if isinstance(layer, nn.Linear):
                 nn.init.xavier_normal_(layer.weight)
                 nn.init.constant_(layer.bias, 0)
-        # Initialize outputs with small weights for stability
-        nn.init.uniform_(self.mean.weight, -3e-3, 3e-3)
-        nn.init.constant_(self.mean.bias, 0)
         
         # Twin Q-networks
         self.q1 = self._create_q_network(state_dim, action_dim)
@@ -178,23 +171,13 @@ class SACAgent(nn.Module):
         self.q1_target.load_state_dict(self.q1.state_dict())
         self.q2_target.load_state_dict(self.q2.state_dict())
         
-        # Different learning rates for different components with reduced critic LR
-        self.optimizer = optim.AdamW([
-            {'params': self.actor.parameters(), 'lr': 1e-5},  # Lower actor LR
-            {'params': self.mean.parameters(), 'lr': 1e-5},
-            {'params': self.log_std, 'lr': 1e-5},
-            {'params': self.log_alpha, 'lr': 1e-5},  # Reduced from 1e-4
-            {'params': self.q1.parameters(), 'lr': 1e-4},  # Reduced from 3e-4
-            {'params': self.q2.parameters(), 'lr': 1e-4}   # Reduced from 3e-4
-        ], weight_decay=1e-4)
-        
-        # Learning rate scheduler
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, 'min', patience=5, factor=0.5)
+        # Separate optimizers for actor and critic
+        self.actor_optim = optim.Adam(self.actor.parameters(), lr=1e-5)
+        self.critic_optim = optim.Adam(
+            list(self.q1.parameters()) + list(self.q2.parameters()), lr=1e-4)
 
     def _create_q_network(self, state_dim, action_dim):
         """Create more stable Q-network with gradient protections"""
-        print(f"Creating Q-network with state_dim:{state_dim} action_dim:{action_dim}")
         net = nn.Sequential(
             nn.Linear(state_dim + action_dim, 128),
             nn.LayerNorm(128),  # Add layer normalization
@@ -209,34 +192,11 @@ class SACAgent(nn.Module):
             if isinstance(layer, nn.Linear):
                 nn.init.xavier_uniform_(layer.weight, gain=nn.init.calculate_gain('leaky_relu', 0.01))
                 nn.init.constant_(layer.bias, 0)
-        print(f"Q-network structure: {net}")
         return net
 
-    def forward(self, state):
-        """Action selection with entropy regularization"""
-        mean, log_std = self.actor_forward(state)
-        print(f"Mean shape: {mean.shape}, Log_std shape: {log_std.shape}")  # Should be [batch,1]
-        return mean, log_std
-        
-    def actor_forward(self, state):
-        """Separate actor forward function for clarity"""
-        hidden = self.actor(state)
-        mean = self.mean(hidden)
-        log_std = torch.clamp(self.log_std, min=-5, max=2)  # Adjusted bounds
-        return mean, log_std
-
-    def act(self, state, deterministic=False):
+    def act(self, state):
         """Direct tanh output without scaling"""
-        mean, log_std = self.forward(state)
-        std = log_std.exp()
-        dist = torch.distributions.Normal(mean, std)
-        
-        if deterministic:
-            action = torch.tanh(mean)  # Removed scaling
-        else:
-            action = torch.tanh(dist.rsample())  # Removed scaling
-            
-        return action
+        return torch.tanh(self.actor(state))
 
     def update_targets(self, tau=0.05):  # Changed from 0.005 to 0.05
         """Soft target network updates"""
@@ -268,15 +228,14 @@ class ReplayBuffer:
 # Training Core
 # --------------------------
 
-def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', log_dir="logs"):
-    """Enhanced training loop with detailed logging
+def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models'):
+    """Simplified training loop for SAC
     
     Args:
         dataset_path: Path to the training dataset CSV
         epochs: Number of training epochs
         batch_size: Batch size for training
-        save_path: Path to save the trained model directory
-        log_dir: Directory to save training logs
+        save_path: Path to save the trained model
         
     Returns:
         Trained SAC agent
@@ -284,368 +243,95 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', log_
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Training on device: {device}")
     
-    # Create unique timestamped directory
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = f"sac_model_{timestamp}"
-    
-    # Update paths to use timestamped directory
-    model_dir = Path(save_path) / run_name
-    model_dir.mkdir(parents=True, exist_ok=True)
-    
-    log_dir = Path(log_dir) / run_name
-    log_dir.mkdir(parents=True, exist_ok=True)
-    
-    final_model_path = model_dir / f"{run_name}.pth"
-    log_path = log_dir / "training_log.csv"
-    
     # Initialize components
     dataset = DiabetesDataset(dataset_path)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     agent = SACAgent().to(device)
     
-    # Initialize CSV logger
-    fieldnames = [
-        'epoch', 'critic_loss', 'actor_loss', 
-        'q1_value', 'q2_value', 'action_mean', 
-        'action_std', 'entropy', 'grad_norm',
-        'log_std_mean', 'alpha', 'lr'
-    ]
+    with tqdm(range(epochs), desc="Training") as pbar:
+        for epoch in pbar:
+            epoch_critic_loss = 0.0
+            epoch_actor_loss = 0.0
+            
+            for batch in dataloader:
+                # Prepare batch
+                states = batch['state'].to(device)
+                actions = batch['action'].to(device)
+                rewards = batch['reward'].to(device)
+                next_states = batch['next_state'].to(device)
+                dones = batch['done'].to(device)
+                
+                # Critic update
+                with torch.no_grad():
+                    next_actions = agent.act(next_states)
+                    q1_next = agent.q1_target(torch.cat([next_states, next_actions], 1))
+                    q2_next = agent.q2_target(torch.cat([next_states, next_actions], 1))
+                    q_next = torch.min(q1_next, q2_next)
+                    target_q = rewards + 0.99 * (1 - dones) * q_next
+                    target_q = torch.clamp(target_q, -10.0, 10.0)
+                
+                current_q1 = agent.q1(torch.cat([states, actions], 1))
+                current_q2 = agent.q2(torch.cat([states, actions], 1))
+                
+                # MSE loss for critic
+                q1_loss = F.mse_loss(current_q1, target_q)
+                q2_loss = F.mse_loss(current_q2, target_q)
+                critic_loss = q1_loss + q2_loss
+                
+                agent.critic_optim.zero_grad()
+                critic_loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    list(agent.q1.parameters()) + list(agent.q2.parameters()), 
+                    1.0
+                )
+                agent.critic_optim.step()
+                
+                # Actor update
+                pred_actions = agent.act(states)
+                actor_loss = -agent.q1(torch.cat([states, pred_actions], 1)).mean()
+                
+                agent.actor_optim.zero_grad()
+                actor_loss.backward()
+                torch.nn.utils.clip_grad_norm_(agent.actor.parameters(), 1.0)
+                agent.actor_optim.step()
+                
+                # Update target networks
+                agent.update_targets()
+                
+                # Track losses
+                epoch_critic_loss += critic_loss.item()
+                epoch_actor_loss += actor_loss.item()
+            
+            # Average losses
+            num_batches = len(dataloader)
+            epoch_critic_loss /= num_batches
+            epoch_actor_loss /= num_batches
+            
+            # Update progress bar
+            pbar.set_postfix({
+                'Critic Loss': f"{epoch_critic_loss:.3f}",
+                'Actor Loss': f"{epoch_actor_loss:.3f}"
+            })
+            
+            # Save checkpoint every 50 epochs
+            if (epoch+1) % 50 == 0:
+                Path(save_path).mkdir(parents=True, exist_ok=True)
+                checkpoint_path = os.path.join(save_path, f"sac_checkpoint_epoch{epoch+1}.pth")
+                torch.save(agent.state_dict(), checkpoint_path)
+                print(f"Checkpoint saved to {checkpoint_path}")
     
-    with open(log_path, 'w', newline='') as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-
-        with tqdm(range(epochs), desc="Training") as pbar:
-            for epoch in pbar:
-                epoch_metrics = {
-                    'critic_loss': 0.0,
-                    'actor_loss': 0.0,
-                    'q1_value': 0.0,
-                    'q2_value': 0.0,
-                    'action_mean': 0.0,
-                    'action_std': 0.0,
-                    'entropy': 0.0,
-                    'grad_norm': 0.0,
-                }
-                
-                for batch in dataloader:
-                    # Prepare batch with normalization for stability
-                    states_raw = batch['state'].to(device)
-                    states = (states_raw - states_raw.mean(0)) / (states_raw.std(0) + 1e-8)
-                    actions = batch['action'].to(device)
-                    rewards = batch['reward'].to(device)
-                    next_states_raw = batch['next_state'].to(device)
-                    next_states = (next_states_raw - next_states_raw.mean(0)) / (next_states_raw.std(0) + 1e-8)
-                    dones = batch['done'].to(device)
-                    
-                    # Add dimension checks
-                    print(f"State shape: {states.shape}")  # Should be [batch,8]
-                    print(f"Action shape: {actions.shape}")  # Should be [batch,1]
-                    
-                    # Add input value checks
-                    print(f"State stats: mean={states.mean().item():.2f} ±{states.std().item():.2f}")
-                    print(f"Action stats: mean={actions.mean().item():.2f} ±{actions.std().item():.2f}")
-                    
-                    # Add Q-network input dimension check
-                    state_action = torch.cat([states, actions], 1)
-                    assert state_action.shape[1] == 8 + 1, \
-                        f"Invalid Q-network input shape: {state_action.shape}, expected 9 features"
-                    
-                    # Verify tensor ranges
-                    print(f"State range: {states.min().item():.1f} to {states.max().item():.1f}")
-                    print(f"Action range: {actions.min().item():.1f} to {actions.max().item():.1f}")
-                    
-                    # Add numerical stability checks
-                    if torch.any(torch.isnan(states)) or torch.any(torch.isinf(states)):
-                        print("Invalid states detected:")
-                        print(states)
-                        raise ValueError("NaN/Inf in states")
-
-                    if torch.any(actions < -1) or torch.any(actions > 1):
-                        print("Invalid actions detected:")
-                        print(actions)
-                        raise ValueError("Actions outside [-1,1] range")
-                    
-                    # Add NaN checks
-                    if torch.isnan(states).any() or torch.isnan(actions).any():
-                        print("NaN detected in input data!")
-                        continue
-                    
-                    # Critic update
-                    # Current Q estimates
-                    state_action = torch.cat([states, actions], 1)
-                    print(f"State-action input shape: {state_action.shape}")  # Debug
-                    
-                    # Register hooks to detect NaN gradients
-                    def grad_hook(name):
-                        def hook(grad):
-                            if torch.isnan(grad).any():
-                                print(f"NaN gradient in {name}!")
-                        return hook
-                        
-                    for name, param in agent.q1.named_parameters():
-                        param.register_hook(grad_hook(f'q1.{name}'))
-                    for name, param in agent.q2.named_parameters():
-                        param.register_hook(grad_hook(f'q2.{name}'))
-                    
-                    current_q1 = agent.q1(state_action)
-                    current_q2 = agent.q2(state_action)
-                    
-                    # Add output value clamping
-                    current_q1 = torch.clamp(current_q1, -10, 10)
-                    current_q2 = torch.clamp(current_q2, -10, 10)
-                    
-                    print(f"Q1 values: min={current_q1.min().item():.4f}, max={current_q1.max().item():.4f}, mean={current_q1.mean().item():.4f}")
-                    
-                    with torch.no_grad():
-                        next_actions = agent.act(next_states)
-                        q1_next = agent.q1_target(torch.cat([next_states, next_actions], 1))
-                        q2_next = agent.q2_target(torch.cat([next_states, next_actions], 1))
-                        q_next = torch.min(q1_next, q2_next)
-                        target_q = rewards + 0.99 * (1 - dones) * q_next
-                        target_q = torch.clamp(target_q, -10.0, 10.0)  # Absolute bounds
-                        
-                        # Add target value sanitization
-                        target_q = torch.nan_to_num(target_q, nan=0.0, posinf=10.0, neginf=-10.0)
-                    
-                    # Add target value checks
-                    print(f"Target Q stats: min={target_q.min().item():.2f}, max={target_q.max().item():.2f}")
-                    
-                    # Add action/value logging
-                    print(f"Q1 outputs: {current_q1.detach().cpu().numpy()[:5]}")  # Show first 5 values
-                    print(f"Target Q: {target_q.detach().cpu().numpy()[:5]}")
-                    print(f"Rewards: {rewards.detach().cpu().numpy()[:5]}")
-                    print(f"Dones: {dones.detach().cpu().numpy()[:5]}")
-                    
-                    # Huber loss for critic (more robust than MSE)
-                    q1_loss = F.huber_loss(current_q1, target_q, delta=1.0)  # Reduced delta
-                    q2_loss = F.huber_loss(current_q2, target_q, delta=1.0)
-                    critic_loss = (q1_loss + q2_loss) * 0.5  # Added averaging
-                    
-                    # Add gradient scaling for critic
-                    scale_gradients = lambda x: x * 0.5  # Scale gradients before clipping
-                    critic_loss = critic_loss * scale_gradients(critic_loss.detach())
-                    
-                    # Actor update
-                    mean, log_std = agent.forward(states)
-                    std = log_std.exp()
-                    dist = torch.distributions.Normal(mean, std)
-                    action_samples = torch.tanh(dist.rsample())  # Removed action scaling
-                    
-                    # Proper Gaussian entropy calculation
-                    entropy = 0.5 * (1.0 + torch.log(2 * torch.tensor(np.pi).to(device)) + log_std).mean()
-                    print(f"Entropy: {entropy.item():.4f}, Target entropy: {agent.target_entropy:.4f}")
-                    
-                    # Use adaptive entropy regularization
-                    alpha = torch.exp(agent.log_alpha).detach()
-                    print(f"Alpha: {alpha.item():.4f}")
-                    
-                    # Q-values for policy with entropy regularization
-                    q1_policy = agent.q1(torch.cat([states, action_samples], 1))
-                    
-                    # Proper SAC actor loss formulation
-                    actor_loss = (alpha * entropy - q1_policy).mean()
-                    
-                    # Add alpha loss calculation
-                    alpha_loss = -(agent.log_alpha * (entropy - agent.target_entropy).detach()).mean()
-                    print(f"Alpha loss: {alpha_loss.item():.4f}")
-                    
-                    # Helper function to check gradients
-                    def check_grads(parameters):
-                        for p in parameters:
-                            if p.grad is not None and torch.isnan(p.grad).any():
-                                print(f"NaN gradients in {[n for n, param in agent.named_parameters() if param is p]}")
-                                return True
-                        return False
-                    
-                    # Separate updates for better stability
-                    # 1. Critic update
-                    agent.optimizer.zero_grad()
-                    critic_loss.backward()
-                    
-                    # Gradient monitoring and clipping for critic
-                    critic_grad_norm = torch.nn.utils.clip_grad_norm_(
-                        list(agent.q1.parameters()) + list(agent.q2.parameters()), 
-                        1.0
-                    )
-                    torch.nn.utils.clip_grad_value_(
-                        list(agent.q1.parameters()) + list(agent.q2.parameters()),
-                        1.0
-                    )
-                    
-                    # Check for NaN in critic gradients
-                    if not check_grads(list(agent.q1.parameters()) + list(agent.q2.parameters())):
-                        agent.optimizer.step()
-                    else:
-                        print("Skipping critic update due to NaN gradients")
-                        agent.optimizer.zero_grad()
-                    
-                    # 2. Actor update
-                    agent.optimizer.zero_grad()
-                    actor_loss.backward()
-                    
-                    # Gradient monitoring and clipping for actor
-                    actor_grad_norm = torch.nn.utils.clip_grad_norm_(
-                        list(agent.actor.parameters()) + [agent.log_std],
-                        1.0
-                    )
-                    torch.nn.utils.clip_grad_value_(
-                        list(agent.actor.parameters()) + [agent.log_std],
-                        1.0
-                    )
-                    
-                    # Check for NaN in actor gradients using the helper function
-                    if not check_grads(list(agent.actor.parameters()) + [agent.log_std]):
-                        agent.optimizer.step()
-                    else:
-                        print("Skipping actor update due to NaN gradients")
-                        agent.optimizer.zero_grad()
-                    
-                    # 3. Alpha update
-                    agent.optimizer.zero_grad()
-                    alpha_loss.backward()
-                    
-                    # Gradient clipping for alpha
-                    alpha_grad_norm = torch.nn.utils.clip_grad_norm_([agent.log_alpha], 1.0)
-                    
-                    # Check for NaN in alpha gradient using the helper function
-                    if not check_grads([agent.log_alpha]):
-                        agent.optimizer.step()
-                    else:
-                        print("Skipping alpha update due to NaN gradients")
-                        agent.optimizer.zero_grad()
-                    
-                    # Total gradient norm for logging
-                    grad_norm = critic_grad_norm + actor_grad_norm + alpha_grad_norm
-                    
-                    # Print gradient norms for debugging
-                    print(f"Gradient norms - Critic: {critic_grad_norm:.4f}, Actor: {actor_grad_norm:.4f}, Alpha: {alpha_grad_norm:.4f}")
-                    
-                    # Update target networks
-                    agent.update_targets()
-                    
-                    # Monitor parameter values for debugging
-                    with torch.no_grad():
-                        for name, param in agent.named_parameters():
-                            if torch.isnan(param).any():
-                                print(f"NaN detected in parameter {name}")
-                    
-                    # Accumulate metrics
-                    epoch_metrics['critic_loss'] += critic_loss.item()
-                    epoch_metrics['actor_loss'] += actor_loss.item()
-                    epoch_metrics['q1_value'] += current_q1.mean().item()
-                    epoch_metrics['q2_value'] += current_q2.mean().item()
-                    epoch_metrics['action_mean'] += action_samples.mean().item()
-                    epoch_metrics['action_std'] += action_samples.std().item()
-                    epoch_metrics['entropy'] += entropy.item()
-                    epoch_metrics['grad_norm'] += grad_norm.item()
-                
-                # Average metrics over batches
-                num_batches = len(dataloader)
-                log_entry = {
-                    'epoch': epoch + 1,
-                    'critic_loss': epoch_metrics['critic_loss'] / num_batches,
-                    'actor_loss': epoch_metrics['actor_loss'] / num_batches,
-                    'q1_value': epoch_metrics['q1_value'] / num_batches,
-                    'q2_value': epoch_metrics['q2_value'] / num_batches,
-                    'action_mean': epoch_metrics['action_mean'] / num_batches,
-                    'action_std': epoch_metrics['action_std'] / num_batches,
-                    'entropy': epoch_metrics['entropy'] / num_batches,
-                    'grad_norm': epoch_metrics['grad_norm'] / num_batches,
-                    'log_std_mean': agent.log_std.mean().item(),
-                    'alpha': torch.exp(agent.log_std).mean().item(),
-                    'lr': agent.optimizer.param_groups[0]['lr']
-                }
-                
-                writer.writerow(log_entry)
-                
-                # Update progress bar
-                pbar.set_postfix({
-                    'Critic Loss': f"{log_entry['critic_loss']:.3f}",
-                    'Actor Loss': f"{log_entry['actor_loss']:.3f}",
-                    'Q Values': f"{(log_entry['q1_value'] + log_entry['q2_value'])/2:.3f}"
-                })
-                
-                # Update learning rate scheduler
-                agent.scheduler.step(log_entry['critic_loss'])
-                
-                # Save checkpoint
-                if (epoch+1) % 50 == 0:
-                    checkpoint_dir = model_dir / "checkpoints"
-                    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-                    checkpoint_path = checkpoint_dir / f"checkpoint_epoch{epoch+1}.pth"
-                    
-                    # Save both model weights and training metadata
-                    torch.save({
-                        'epoch': epoch + 1,
-                        'model_state_dict': agent.state_dict(),
-                        'optimizer_state_dict': agent.optimizer.state_dict(),
-                        'critic_loss': log_entry['critic_loss'],
-                        'actor_loss': log_entry['actor_loss'],
-                    }, str(checkpoint_path))
-                    print(f"Checkpoint saved to {checkpoint_path}")
-    
-    # Save final model with metadata
-    torch.save({
-        'epoch': epochs,
-        'model_state_dict': agent.state_dict(),
-        'optimizer_state_dict': agent.optimizer.state_dict(),
-        'model_type': 'SAC',
-        'state_dim': 8,
-        'action_dim': 1,
-        'training_dataset': os.path.basename(dataset_path),
-    }, str(final_model_path))
+    # Save final model
+    Path(save_path).mkdir(parents=True, exist_ok=True)
+    final_model_path = os.path.join(save_path, "sac_final_model.pth")
+    torch.save(agent.state_dict(), final_model_path)
     print(f"Training complete. Model saved to {final_model_path}")
     return agent
 
-def analyze_training_log(log_path="logs/sac/training_log.csv", output_dir="logs/sac/analysis"):
-    """Analyze training log and generate visualizations
-    
-    Args:
-        log_path: Path to the training log CSV file
-        output_dir: Directory to save analysis visualizations
-        
-    Returns:
-        None, but saves visualization files to output_dir
-    """
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    
-    # Read log data
-    df = pd.read_csv(log_path)
-    
-    # Create dynamic subplot grid
-    metrics = [col for col in df.columns if col != 'epoch']
-    n_metrics = len(metrics)
-    n_cols = 3
-    n_rows = (n_metrics + n_cols - 1) // n_cols  # Ceiling division
-    
-    fig, axs = plt.subplots(n_rows, n_cols, figsize=(18, 4*n_rows))
-    fig.suptitle('Training Metrics Analysis', fontsize=16)
-    
-    # Flatten axes array for easier iteration
-    axs = axs.flatten()
-    
-    for idx, metric in enumerate(metrics):
-        ax = axs[idx]
-        ax.plot(df['epoch'], df[metric])
-        ax.set_title(metric.replace('_', ' ').title())
-        ax.set_xlabel('Epoch')
-        ax.grid(True)
-    
-    # Hide empty subplots
-    for idx in range(n_metrics, len(axs)):
-        axs[idx].axis('off')
-    
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.savefig(Path(output_dir) / "training_metrics.png")
-    plt.close()
-    
-    print(f"Analysis plots saved to {output_dir}")
 
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description='Train SAC-CQL agent for diabetes management')
+    parser = argparse.ArgumentParser(description='Train SAC agent for diabetes management')
     parser.add_argument('--dataset', type=str, default="datasets/processed/563-training.csv", 
                         help='Path to the training dataset')
     parser.add_argument('--epochs', type=int, default=500, 
@@ -654,22 +340,13 @@ if __name__ == "__main__":
                         help='Batch size for training')
     parser.add_argument('--save_path', type=str, default="models", 
                         help='Directory to save the trained model')
-    parser.add_argument('--log_dir', type=str, default="logs", 
-                        help='Directory to save training logs')
     
     args = parser.parse_args()
     
-    # Example usage with command line arguments
+    # Train the agent
     agent = train_sac(
         dataset_path=args.dataset,
         epochs=args.epochs,
         batch_size=args.batch_size,
-        save_path=args.save_path,
-        log_dir=args.log_dir
-    )
-    
-    # Analyze training results
-    analyze_training_log(
-        log_path=os.path.join(args.log_dir, "training_log.csv"),
-        output_dir=os.path.join(args.log_dir, "analysis")
+        save_path=args.save_path
     )
