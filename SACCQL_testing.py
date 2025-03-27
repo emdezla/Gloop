@@ -38,6 +38,10 @@ class DiabetesTestDataset(DiabetesDataset):
         self.meal_data = df["meal"].values.astype(np.float32) if "meal" in df.columns else None
         self.patient_id = os.path.basename(csv_file).split('-')[0] if '-' in os.path.basename(csv_file) else "unknown"
         
+        # Add action range validation
+        if np.any(self.actions < -1) or np.any(self.actions > 1):
+            print("Warning: Actions outside [-1, 1] range detected in test set")
+        
         # Calculate time in range metrics
         self.time_in_range = self._calculate_time_in_range(self.glucose_raw)
         
@@ -119,7 +123,7 @@ def load_model(model_path):
             state_dict = checkpoint['model_state_dict']
             model_type = checkpoint.get('model_type', 'SAC')
             state_dim = checkpoint.get('state_dim', 8)
-            action_dim = checkpoint.get('action_dim', 2)
+            action_dim = checkpoint.get('action_dim', 1)  # Changed from 2 to 1
             training_dataset = checkpoint.get('training_dataset', 'unknown')
             epoch = checkpoint.get('epoch', 'unknown')
             
@@ -138,7 +142,7 @@ def load_model(model_path):
             # Old format (just state dict)
             state_dict = checkpoint
             state_dim = 8
-            action_dim = 2
+            action_dim = 1  # Changed from 2 to 1
             print("Loading model (legacy format)")
             metadata = {
                 'model_type': 'SAC',
@@ -198,10 +202,11 @@ def evaluate_model(model, test_dataset, model_metadata=None, output_dir="logs/ev
         "mean_reward": 0.0,
         "action_mean": 0.0,
         "action_std": 0.0,
-        "basal_rmse": 0.0,
-        "bolus_rmse": 0.0,
+        "action_range": 0.0,  # New metric
         "evaluation_timestamp": timestamp,
         "patient_id": test_dataset.patient_id,
+        "overfitting_risk": 0.0,  # New metric
+        "underfitting_risk": 0.0,  # New metric
     }
     
     # Add model metadata if available
@@ -286,12 +291,26 @@ def evaluate_model(model, test_dataset, model_metadata=None, output_dir="logs/ev
     metrics["mean_reward"] = float(np.mean(all_rewards))
     metrics["action_mean"] = float(np.mean(all_actions_pred))
     metrics["action_std"] = float(np.std(all_actions_pred))
+    metrics["action_range"] = float(np.ptp(all_actions_pred))  # Peak-to-peak range
     
-    # Calculate per-component metrics
-    metrics["basal_rmse"] = float(np.sqrt(mean_squared_error(all_actions_true[:, 0], all_actions_pred[:, 0])))
-    metrics["bolus_rmse"] = float(np.sqrt(mean_squared_error(all_actions_true[:, 1], all_actions_pred[:, 1])))
-    metrics["basal_mae"] = float(mean_absolute_error(all_actions_true[:, 0], all_actions_pred[:, 0]))
-    metrics["bolus_mae"] = float(mean_absolute_error(all_actions_true[:, 1], all_actions_pred[:, 1]))
+    # Calculate over/underfitting risk metrics
+    action_std = metrics["action_std"]
+    action_range = metrics["action_range"]
+    r2 = metrics["r2_score"]
+    
+    # Overfitting indicators
+    metrics["overfitting_risk"] = float(
+        (action_std < 0.1) * 0.5 + 
+        (r2 > 0.95) * 0.3 + 
+        (action_range < 0.5) * 0.2
+    )
+    
+    # Underfitting indicators  
+    metrics["underfitting_risk"] = float(
+        (action_std > 0.9) * 0.4 +
+        (r2 < 0.3) * 0.4 +
+        (action_range > 1.8) * 0.2
+    )
     
     # Add time in range metrics
     metrics.update(test_dataset.time_in_range)
@@ -407,12 +426,29 @@ def generate_clinical_report(metrics, output_dir):
 - **Coefficient of Variation**: {cv}
 
 ## Model Performance
-- **Basal Insulin RMSE**: {metrics['basal_rmse']:.4f}
-- **Bolus Insulin RMSE**: {metrics['bolus_rmse']:.4f}
+- **Action RMSE**: {metrics['rmse']:.4f}
+- **Action MAE**: {metrics['mae']:.4f}
 - **Overall R² Score**: {metrics['r2_score']:.4f}
 
-## Clinical Recommendations
+## Model Training Quality Assessment
 """
+
+    # Add over/underfitting assessment
+    if metrics['overfitting_risk'] > 0.6:
+        report += "- **High Overfitting Risk**: Model shows limited action variation and extremely high R² score\n"
+    elif metrics['overfitting_risk'] > 0.3:
+        report += "- **Moderate Overfitting Risk**: Consider regularization or early stopping\n"
+        
+    if metrics['underfitting_risk'] > 0.6:
+        report += "- **High Underfitting Risk**: Poor predictive performance with excessive action variation\n"
+    elif metrics['underfitting_risk'] > 0.3:
+        report += "- **Moderate Underfitting Risk**: Model may need more training or capacity\n"
+        
+    report += f"- Action Standard Deviation: {metrics['action_std']:.3f} (ideal: 0.3-0.7)\n"
+    report += f"- Action Range: {metrics['action_range']:.3f} (ideal: 1.0-1.8)\n"
+    report += f"- R² Score: {metrics['r2_score']:.3f} (ideal: 0.6-0.9)\n"
+    
+    report += "\n## Clinical Recommendations\n"
     
     # Add recommendations based on metrics
     if metrics['time_in_range'] < 70:
@@ -448,43 +484,23 @@ def generate_evaluation_plots(states, actions_true, actions_pred, glucose, rewar
     sns.set(style="whitegrid")
     
     # 1. Action comparison plot
-    plt.figure(figsize=(12, 6))
+    plt.figure(figsize=(8, 6))
     
-    # Basal comparison
-    plt.subplot(1, 2, 1)
-    plt.scatter(actions_true[:, 0], actions_pred[:, 0], alpha=0.3)
-    plt.plot([0, 1], [0, 1], 'r--')  # Diagonal line
+    plt.scatter(actions_true, actions_pred, alpha=0.3)
+    plt.plot([-1, 1], [-1, 1], 'r--')  # Diagonal line
     
     # Add regression line
-    z = np.polyfit(actions_true[:, 0], actions_pred[:, 0], 1)
+    z = np.polyfit(actions_true.flatten(), actions_pred.flatten(), 1)
     p = np.poly1d(z)
-    plt.plot(np.linspace(0, 1, 100), p(np.linspace(0, 1, 100)), 'b-', alpha=0.7)
+    plt.plot(np.linspace(-1, 1, 100), p(np.linspace(-1, 1, 100)), 'b-', alpha=0.7)
     
     # Add correlation coefficient
-    corr = np.corrcoef(actions_true[:, 0], actions_pred[:, 0])[0, 1]
+    corr = np.corrcoef(actions_true.flatten(), actions_pred.flatten())[0, 1]
     plt.text(0.05, 0.95, f'r = {corr:.3f}', transform=plt.gca().transAxes)
     
-    plt.xlabel('True Basal')
-    plt.ylabel('Predicted Basal')
-    plt.title('Basal Rate Comparison')
-    
-    # Bolus comparison
-    plt.subplot(1, 2, 2)
-    plt.scatter(actions_true[:, 1], actions_pred[:, 1], alpha=0.3)
-    plt.plot([0, 1], [0, 1], 'r--')  # Diagonal line
-    
-    # Add regression line
-    z = np.polyfit(actions_true[:, 1], actions_pred[:, 1], 1)
-    p = np.poly1d(z)
-    plt.plot(np.linspace(0, 1, 100), p(np.linspace(0, 1, 100)), 'b-', alpha=0.7)
-    
-    # Add correlation coefficient
-    corr = np.corrcoef(actions_true[:, 1], actions_pred[:, 1])[0, 1]
-    plt.text(0.05, 0.95, f'r = {corr:.3f}', transform=plt.gca().transAxes)
-    
-    plt.xlabel('True Bolus')
-    plt.ylabel('Predicted Bolus')
-    plt.title('Bolus Comparison')
+    plt.xlabel('True Action')
+    plt.ylabel('Predicted Action')
+    plt.title('Action Comparison')
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "action_comparison.png"), dpi=300)
@@ -524,22 +540,13 @@ def generate_evaluation_plots(states, actions_true, actions_pred, glucose, rewar
     plt.close()
     
     # 3. Action distribution
-    plt.figure(figsize=(12, 6))
+    plt.figure(figsize=(8, 6))
     
-    plt.subplot(1, 2, 1)
-    sns.histplot(actions_pred[:, 0], bins=30, kde=True, color='blue', label='Predicted')
-    sns.histplot(actions_true[:, 0], bins=30, kde=True, color='green', alpha=0.6, label='True')
-    plt.xlabel('Basal Rate')
+    sns.histplot(actions_pred, bins=30, kde=True, color='blue', label='Predicted')
+    sns.histplot(actions_true, bins=30, kde=True, color='green', alpha=0.6, label='True')
+    plt.xlabel('Action Value')
     plt.ylabel('Frequency')
-    plt.title('Basal Rate Distribution')
-    plt.legend()
-    
-    plt.subplot(1, 2, 2)
-    sns.histplot(actions_pred[:, 1], bins=30, kde=True, color='blue', label='Predicted')
-    sns.histplot(actions_true[:, 1], bins=30, kde=True, color='green', alpha=0.6, label='True')
-    plt.xlabel('Bolus')
-    plt.ylabel('Frequency')
-    plt.title('Bolus Distribution')
+    plt.title('Action Distribution')
     plt.legend()
     
     plt.tight_layout()
@@ -574,47 +581,40 @@ def generate_evaluation_plots(states, actions_true, actions_pred, glucose, rewar
     # 5. State-action heatmap for key features
     plt.figure(figsize=(15, 10))
     
-    # Glucose vs Basal
-    plt.subplot(2, 3, 1)
+    # Glucose vs Action
+    plt.subplot(2, 2, 1)
     glucose_values = states[:, 0]  # First state dimension is glucose
-    plt.hexbin(glucose_values, actions_pred[:, 0], gridsize=30, cmap='viridis')
+    plt.hexbin(glucose_values, actions_pred.flatten(), gridsize=30, cmap='viridis')
     plt.xlabel('Glucose')
-    plt.ylabel('Predicted Basal')
-    plt.title('Glucose vs Basal')
+    plt.ylabel('Predicted Action')
+    plt.title('Glucose vs Action')
     plt.colorbar(label='Count')
     
-    # Glucose vs Bolus
-    plt.subplot(2, 3, 2)
-    plt.hexbin(glucose_values, actions_pred[:, 1], gridsize=30, cmap='viridis')
-    plt.xlabel('Glucose')
-    plt.ylabel('Predicted Bolus')
-    plt.title('Glucose vs Bolus')
-    plt.colorbar(label='Count')
-    
-    # IOB vs Bolus
-    plt.subplot(2, 3, 3)
+    # IOB vs Action
+    plt.subplot(2, 2, 2)
     iob_values = states[:, 6]  # 7th state dimension is IOB
-    plt.hexbin(iob_values, actions_pred[:, 1], gridsize=30, cmap='viridis')
+    plt.hexbin(iob_values, actions_pred.flatten(), gridsize=30, cmap='viridis')
     plt.xlabel('IOB')
-    plt.ylabel('Predicted Bolus')
-    plt.title('IOB vs Bolus')
+    plt.ylabel('Predicted Action')
+    plt.title('IOB vs Action')
     plt.colorbar(label='Count')
     
-    # Hour vs Basal
-    plt.subplot(2, 3, 4)
+    # Hour vs Action
+    plt.subplot(2, 2, 3)
     hour_values = states[:, 7]  # 8th state dimension is hour
-    plt.hexbin(hour_values, actions_pred[:, 0], gridsize=30, cmap='viridis')
+    plt.hexbin(hour_values, actions_pred.flatten(), gridsize=30, cmap='viridis')
     plt.xlabel('Hour')
-    plt.ylabel('Predicted Basal')
-    plt.title('Hour vs Basal')
+    plt.ylabel('Predicted Action')
+    plt.title('Hour vs Action')
     plt.colorbar(label='Count')
     
-    # Hour vs Bolus
-    plt.subplot(2, 3, 5)
-    plt.hexbin(hour_values, actions_pred[:, 1], gridsize=30, cmap='viridis')
-    plt.xlabel('Hour')
-    plt.ylabel('Predicted Bolus')
-    plt.title('Hour vs Bolus')
+    # Glucose Derivative vs Action
+    plt.subplot(2, 2, 4)
+    glu_d_values = states[:, 1]  # 2nd state dimension is glucose derivative
+    plt.hexbin(glu_d_values, actions_pred.flatten(), gridsize=30, cmap='viridis')
+    plt.xlabel('Glucose Rate of Change')
+    plt.ylabel('Predicted Action')
+    plt.title('Glucose Rate of Change vs Action')
     plt.colorbar(label='Count')
     
     plt.tight_layout()
@@ -624,39 +624,38 @@ def generate_evaluation_plots(states, actions_true, actions_pred, glucose, rewar
     # 6. Error analysis plot (new)
     plt.figure(figsize=(12, 10))
     
-    # Basal error vs glucose
+    # Action error vs glucose
     plt.subplot(2, 2, 1)
-    basal_errors = actions_pred[:, 0] - actions_true[:, 0]
-    plt.scatter(glucose_values, basal_errors, alpha=0.3)
+    action_errors = actions_pred.flatten() - actions_true.flatten()
+    plt.scatter(glucose_values, action_errors, alpha=0.3)
     plt.axhline(y=0, color='r', linestyle='--')
     plt.xlabel('Glucose (mg/dL)')
-    plt.ylabel('Basal Error (Predicted - True)')
-    plt.title('Basal Error vs Glucose')
+    plt.ylabel('Action Error (Predicted - True)')
+    plt.title('Action Error vs Glucose')
     
-    # Bolus error vs glucose
+    # Action error vs glucose derivative
     plt.subplot(2, 2, 2)
-    bolus_errors = actions_pred[:, 1] - actions_true[:, 1]
-    plt.scatter(glucose_values, bolus_errors, alpha=0.3)
+    plt.scatter(glu_d_values, action_errors, alpha=0.3)
     plt.axhline(y=0, color='r', linestyle='--')
-    plt.xlabel('Glucose (mg/dL)')
-    plt.ylabel('Bolus Error (Predicted - True)')
-    plt.title('Bolus Error vs Glucose')
+    plt.xlabel('Glucose Rate of Change')
+    plt.ylabel('Action Error (Predicted - True)')
+    plt.title('Action Error vs Glucose Rate of Change')
     
-    # Basal error vs hour
+    # Action error vs hour
     plt.subplot(2, 2, 3)
-    plt.scatter(hour_values, basal_errors, alpha=0.3)
+    plt.scatter(hour_values, action_errors, alpha=0.3)
     plt.axhline(y=0, color='r', linestyle='--')
     plt.xlabel('Hour of Day')
-    plt.ylabel('Basal Error (Predicted - True)')
-    plt.title('Basal Error vs Time of Day')
+    plt.ylabel('Action Error (Predicted - True)')
+    plt.title('Action Error vs Time of Day')
     
-    # Bolus error vs IOB
+    # Action error vs IOB
     plt.subplot(2, 2, 4)
-    plt.scatter(iob_values, bolus_errors, alpha=0.3)
+    plt.scatter(iob_values, action_errors, alpha=0.3)
     plt.axhline(y=0, color='r', linestyle='--')
     plt.xlabel('Insulin on Board (IOB)')
-    plt.ylabel('Bolus Error (Predicted - True)')
-    plt.title('Bolus Error vs IOB')
+    plt.ylabel('Action Error (Predicted - True)')
+    plt.title('Action Error vs IOB')
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "error_analysis.png"), dpi=300)
@@ -720,10 +719,17 @@ def main():
     # Technical metrics
     print("\nMODEL PERFORMANCE:")
     print(f"Overall RMSE: {metrics['rmse']:.4f}")
-    print(f"Basal RMSE: {metrics['basal_rmse']:.4f}")
-    print(f"Bolus RMSE: {metrics['bolus_rmse']:.4f}")
+    print(f"MAE: {metrics['mae']:.4f}")
     print(f"R² Score: {metrics['r2_score']:.4f}")
     print(f"Mean Reward: {metrics['mean_reward']:.4f}")
+    
+    # Training quality indicators
+    print("\nTRAINING QUALITY INDICATORS:")
+    print(f"Overfitting Risk: {metrics['overfitting_risk']:.2%}")
+    print(f"Underfitting Risk: {metrics['underfitting_risk']:.2%}")
+    print(f"Action STD: {metrics['action_std']:.3f} (Ideal: 0.3-0.7)")
+    print(f"Action Range: {metrics['action_range']:.3f} (Ideal: 1.0-1.8)")
+    print(f"R² Score: {metrics['r2_score']:.3f} (Ideal: 0.6-0.9)")
     
     # Inference metrics
     print(f"\nInference Time: {metrics['inference_time_seconds']:.2f} seconds")
@@ -749,14 +755,19 @@ def main():
             print("\nMETRIC          | CURRENT MODEL | COMPARISON MODEL | DIFFERENCE")
             print("-"*60)
             
-            for key in ['rmse', 'time_in_range', 'mean_reward', 'r2_score']:
+            for key in ['rmse', 'time_in_range', 'mean_reward', 'r2_score', 'overfitting_risk', 'underfitting_risk']:
                 if key in metrics and key in compare_metrics:
                     diff = metrics[key] - compare_metrics[key]
-                    diff_str = f"{diff:+.4f}" if key != 'time_in_range' else f"{diff:+.2f}%"
                     
                     if key == 'time_in_range':
+                        diff_str = f"{diff:+.2f}%"
                         print(f"Time in Range   | {metrics[key]:12.2f}% | {compare_metrics[key]:16.2f}% | {diff_str}")
+                    elif key in ['overfitting_risk', 'underfitting_risk']:
+                        diff_str = f"{diff:+.2%}"
+                        risk_name = "Overfitting" if key == 'overfitting_risk' else "Underfitting"
+                        print(f"{risk_name:14} | {metrics[key]:12.2%} | {compare_metrics[key]:16.2%} | {diff_str}")
                     else:
+                        diff_str = f"{diff:+.4f}"
                         print(f"{key.upper():14} | {metrics[key]:12.4f} | {compare_metrics[key]:16.4f} | {diff_str}")
             
         except Exception as e:
