@@ -48,22 +48,15 @@ class DiabetesDataset(Dataset):
         self._sanitize_transitions()
 
     def _compute_rewards(self, glucose_next):
-        """Safe reward calculation with numerical stability"""
-        # Ensure valid glucose values
-        glucose_next = np.nan_to_num(glucose_next, nan=100.0)
-        glucose_next = np.clip(glucose_next, 40.0, 400.0)  # Realistic physiological range
-        
-        # Compute risk index with stabilized operations
-        with np.errstate(invalid='ignore', divide='ignore'):
+        """Properly scaled rewards"""
+        glucose_next = np.clip(glucose_next, 40, 400)
+        with np.errstate(invalid='ignore'):
             log_term = np.log(glucose_next/180.0)  # Normalize to typical glucose
             risk_index = 10 * (1.509 * (log_term**1.084 - 1.861))**2
-            
-        # Convert to tensor for sigmoid, then back to numpy
-        risk_tensor = torch.tensor(risk_index/50.0)
-        rewards = -torch.sigmoid(risk_tensor).numpy()
         
-        # Apply severe hypoglycemia penalty
-        rewards[glucose_next < 54] = -15.0  # Hypoglycemia threshold
+        # Scale rewards to [-1, 0] range
+        rewards = -np.tanh(risk_index/100)  # Changed from sigmoid to tanh scaling
+        rewards[glucose_next < 54] = -2.0  # Smaller penalty
         return rewards.astype(np.float32)
 
     def _sanitize_transitions(self):
@@ -108,7 +101,8 @@ class SACAgent(nn.Module):
             nn.Tanh()
         )
         self.mean = nn.Linear(64, action_dim)
-        self.log_std = nn.Parameter(torch.zeros(1, action_dim))  # Fixed variance
+        self.log_std = nn.Parameter(torch.full((1, action_dim), -0.5))  # Higher initial std
+        self.action_scale = 1.0
         
         # Initialize weights properly
         for layer in self.actor:
@@ -134,8 +128,8 @@ class SACAgent(nn.Module):
             {'params': self.actor.parameters(), 'lr': 1e-4},
             {'params': self.mean.parameters(), 'lr': 1e-4},
             {'params': self.log_std, 'lr': 1e-4},
-            {'params': self.q1.parameters(), 'lr': 3e-4},
-            {'params': self.q2.parameters(), 'lr': 3e-4}
+            {'params': self.q1.parameters(), 'lr': 1e-4},  # Lower Q-learning rate
+            {'params': self.q2.parameters(), 'lr': 1e-4}   # Lower Q-learning rate
         ], weight_decay=1e-4)
         
         # Learning rate scheduler
@@ -144,13 +138,9 @@ class SACAgent(nn.Module):
         )
 
     def _create_q_network(self, state_dim, action_dim):
-        """Create Q-network with normalization for stability"""
+        """Create Q-network with simpler architecture"""
         return nn.Sequential(
-            nn.Linear(state_dim + action_dim, 256),
-            nn.LayerNorm(256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.LayerNorm(128),
+            nn.Linear(state_dim + action_dim, 128),
             nn.ReLU(),
             nn.Linear(128, 1)
         )
@@ -166,14 +156,14 @@ class SACAgent(nn.Module):
         """Safe action selection with clamping"""
         mean, log_std = self.forward(state)
         if deterministic:
-            action = torch.tanh(mean)
+            action = torch.tanh(mean) * self.action_scale
         else:
             std = log_std.exp()
             dist = torch.distributions.Normal(mean, std)
-            action = torch.tanh(dist.rsample())
+            action = torch.tanh(dist.rsample()) * self.action_scale
         return action
 
-    def update_targets(self, tau=0.005):
+    def update_targets(self, tau=0.05):  # Changed from 0.005 to 0.05
         """Soft target network updates"""
         with torch.no_grad():
             for target, source in zip(self.q1_target.parameters(), self.q1.parameters()):
@@ -240,7 +230,7 @@ def train_sac(dataset_path, epochs=200, batch_size=256, save_path='sac_model.pth
                         # Clip target values for stability
                         q_next = torch.min(q1_next, q2_next)
                         target_q = rewards + 0.99 * (1 - dones) * q_next
-                        target_q = torch.clamp(target_q, -100.0, 0.0)
+                        target_q = torch.clamp(target_q, -10.0, 0.0)  # Tighter value clipping
                     
                     # Current Q estimates
                     current_q1 = agent.q1(torch.cat([states, actions], 1))
@@ -253,14 +243,14 @@ def train_sac(dataset_path, epochs=200, batch_size=256, save_path='sac_model.pth
                     mean, log_std = agent.forward(states)
                     std = log_std.exp()
                     dist = torch.distributions.Normal(mean, std)
-                    action_samples = torch.tanh(dist.rsample())
+                    action_samples = torch.tanh(dist.rsample()) * agent.action_scale  # Add action scaling
                     
                     # Entropy calculation
                     entropy = dist.entropy().mean()
                     
                     # Q-values for policy with entropy regularization
                     q1_policy = agent.q1(torch.cat([states, action_samples], 1))
-                    actor_loss = -q1_policy.mean() - 0.2 * entropy  # Add entropy bonus
+                    actor_loss = -q1_policy.mean() + 0.1 * entropy  # Reduced entropy coefficient
                     
                     # Combined update
                     total_loss = critic_loss + actor_loss
