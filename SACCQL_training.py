@@ -50,14 +50,15 @@ class DiabetesDataset(Dataset):
         self._sanitize_transitions()
 
     def _compute_rewards(self, glucose_next):
-        """Improved reward scaling"""
+        """Safer reward scaling"""
         glucose_next = np.clip(glucose_next, 40, 400)
         with np.errstate(invalid='ignore'):
-            log_term = np.log(glucose_next/180.0)
+            log_term = np.log(glucose_next/180.0 + 1e-8)  # Add epsilon to prevent log(0)
             risk_index = 10 * (1.509 * (log_term**1.084 - 1.861)**2)
         
-        # Better reward scaling using sigmoid instead of tanh
-        rewards = -1 / (1 + np.exp(-risk_index/50))  # Scaled to (-1, 0)
+        # More stable reward calculation
+        rewards = -risk_index / (risk_index + 50)  # Range [-1, 0]
+        rewards = np.clip(rewards, -5.0, 0.0)  # Hard clip
         rewards[glucose_next < 54] = -5.0  # Stronger hypo penalty
         return rewards.astype(np.float32)
 
@@ -104,9 +105,9 @@ class SACAgent(nn.Module):
         )
         self.mean = nn.Linear(64, action_dim)
         self.log_std = nn.Parameter(torch.zeros(1, action_dim))  # Start from neutral
-        self.log_alpha = nn.Parameter(torch.tensor([1.0]))  # Start with higher alpha
-        self.target_entropy = -torch.prod(torch.Tensor([1.0])).item()  # Updated for 1D action
-        self.action_scale = 1.0
+        self.log_alpha = nn.Parameter(torch.tensor([0.0]))  # Start from 0.0 instead of 1.0
+        self.target_entropy = -action_dim  # Should be -1 for 1D action
+        self.action_scale = nn.Parameter(torch.tensor([1.0]), requires_grad=False)  # Changed to Parameter
         
         # Initialize weights properly
         for layer in self.actor:
@@ -143,6 +144,7 @@ class SACAgent(nn.Module):
 
     def _create_q_network(self, state_dim, action_dim):
         """Create Q-network with simpler architecture"""
+        print(f"Creating Q-network with state_dim:{state_dim} action_dim:{action_dim}")  # Debug
         net = nn.Sequential(
             nn.Linear(state_dim + action_dim, 128),
             nn.ReLU(),
@@ -151,13 +153,20 @@ class SACAgent(nn.Module):
         # Initialize final layer weights
         nn.init.uniform_(net[-1].weight, -3e-3, 3e-3)
         nn.init.constant_(net[-1].bias, 0)
+        print(f"Q-network structure: {net}")  # Debug
         return net
 
     def forward(self, state):
         """Action selection with entropy regularization"""
+        mean, log_std = self.actor_forward(state)
+        print(f"Mean shape: {mean.shape}, Log_std shape: {log_std.shape}")  # Should be [batch,1]
+        return mean, log_std
+        
+    def actor_forward(self, state):
+        """Separate actor forward function for clarity"""
         hidden = self.actor(state)
         mean = self.mean(hidden)
-        log_std = torch.clamp(self.log_std, min=-2, max=0)  # Tighter bounds (std between 0.13 and 1.0)
+        log_std = torch.clamp(self.log_std, min=-5, max=2)  # Adjusted bounds
         return mean, log_std
 
     def act(self, state, deterministic=False):
@@ -273,10 +282,36 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', log_
                     next_states = (next_states_raw - next_states_raw.mean(0)) / (next_states_raw.std(0) + 1e-8)
                     dones = batch['done'].to(device)
                     
+                    # Add dimension checks
+                    print(f"State shape: {states.shape}")  # Should be [batch,8]
+                    print(f"Action shape: {actions.shape}")  # Should be [batch,1]
+                    
+                    # Add NaN checks
+                    if torch.isnan(states).any() or torch.isnan(actions).any():
+                        print("NaN detected in input data!")
+                        continue
+                    
                     # Critic update
                     # Current Q estimates
-                    current_q1 = agent.q1(torch.cat([states, actions], 1))
-                    current_q2 = agent.q2(torch.cat([states, actions], 1))
+                    state_action = torch.cat([states, actions], 1)
+                    print(f"State-action input shape: {state_action.shape}")  # Debug
+                    
+                    # Register hooks to detect NaN gradients
+                    def grad_hook(name):
+                        def hook(grad):
+                            if torch.isnan(grad).any():
+                                print(f"NaN gradient in {name}!")
+                        return hook
+                        
+                    for name, param in agent.q1.named_parameters():
+                        param.register_hook(grad_hook(f'q1.{name}'))
+                    for name, param in agent.q2.named_parameters():
+                        param.register_hook(grad_hook(f'q2.{name}'))
+                    
+                    current_q1 = agent.q1(state_action)
+                    current_q2 = agent.q2(state_action)
+                    
+                    print(f"Q1 values: min={current_q1.min().item():.4f}, max={current_q1.max().item():.4f}, mean={current_q1.mean().item():.4f}")
                     
                     with torch.no_grad():
                         next_actions = agent.act(next_states)
@@ -299,48 +334,103 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', log_
                     action_samples = torch.tanh(dist.rsample()) * agent.action_scale  # Add action scaling
                     
                     # Proper Gaussian entropy calculation
-                    entropy = 0.5 * (1.0 + torch.log(2 * torch.tensor(np.pi)) + log_std).mean()
+                    entropy = 0.5 * (1.0 + torch.log(2 * torch.tensor(np.pi).to(device)) + log_std).mean()
+                    print(f"Entropy: {entropy.item():.4f}, Target entropy: {agent.target_entropy:.4f}")
                     
                     # Use adaptive entropy regularization
                     alpha = torch.exp(agent.log_alpha).detach()
+                    print(f"Alpha: {alpha.item():.4f}")
                     
                     # Q-values for policy with entropy regularization
                     q1_policy = agent.q1(torch.cat([states, action_samples], 1))
-                    actor_loss = -q1_policy.mean() + 0.5 * (entropy - agent.target_entropy).mean()  # Stronger entropy bonus
                     
-                    # Combined update
-                    total_loss = critic_loss + actor_loss
+                    # Proper SAC actor loss formulation
+                    actor_loss = (alpha * entropy - q1_policy).mean()
                     
-                    # Check for NaN in loss
-                    if torch.isnan(total_loss).any():
-                        print("NaN detected in loss, skipping update")
-                        continue
-                        
+                    # Add alpha loss calculation
+                    alpha_loss = -(agent.log_alpha * (entropy - agent.target_entropy).detach()).mean()
+                    print(f"Alpha loss: {alpha_loss.item():.4f}")
+                    
+                    # Separate updates for better stability
+                    # 1. Critic update
                     agent.optimizer.zero_grad()
-                    total_loss.backward()
+                    critic_loss.backward()
                     
-                    # Gradient monitoring and clipping
-                    grad_norm = torch.nn.utils.clip_grad_norm_(agent.parameters(), 1.0)
+                    # Gradient monitoring and clipping for critic
+                    critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                        list(agent.q1.parameters()) + list(agent.q2.parameters()), 
+                        1.0
+                    )
+                    torch.nn.utils.clip_grad_value_(
+                        list(agent.q1.parameters()) + list(agent.q2.parameters()),
+                        1.0
+                    )
                     
-                    # Additional gradient clipping for Q-networks
-                    for param in agent.q1.parameters():
-                        param.grad.data.clamp_(-1, 1)
-                    for param in agent.q2.parameters():
-                        param.grad.data.clamp_(-1, 1)
-                    
-                    # Check for NaN in gradients
+                    # Check for NaN in critic gradients
                     has_nan_grad = False
-                    for param in agent.parameters():
+                    for param in list(agent.q1.parameters()) + list(agent.q2.parameters()):
                         if param.grad is not None and torch.isnan(param.grad).any():
                             has_nan_grad = True
                             break
                     
                     if has_nan_grad:
-                        print("NaN detected in gradients, skipping update")
-                        continue
-                        
-                    agent.optimizer.step()
+                        print("NaN detected in critic gradients, skipping critic update")
+                    else:
+                        agent.optimizer.step()
+                    
+                    # 2. Actor update
+                    agent.optimizer.zero_grad()
+                    actor_loss.backward()
+                    
+                    # Gradient monitoring and clipping for actor
+                    actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+                        list(agent.actor.parameters()) + [agent.log_std],
+                        1.0
+                    )
+                    torch.nn.utils.clip_grad_value_(
+                        list(agent.actor.parameters()) + [agent.log_std],
+                        1.0
+                    )
+                    
+                    # Check for NaN in actor gradients
+                    has_nan_grad = False
+                    for param in list(agent.actor.parameters()) + [agent.log_std]:
+                        if param.grad is not None and torch.isnan(param.grad).any():
+                            has_nan_grad = True
+                            break
+                    
+                    if has_nan_grad:
+                        print("NaN detected in actor gradients, skipping actor update")
+                    else:
+                        agent.optimizer.step()
+                    
+                    # 3. Alpha update
+                    agent.optimizer.zero_grad()
+                    alpha_loss.backward()
+                    
+                    # Gradient clipping for alpha
+                    alpha_grad_norm = torch.nn.utils.clip_grad_norm_([agent.log_alpha], 1.0)
+                    
+                    # Check for NaN in alpha gradient
+                    if agent.log_alpha.grad is not None and torch.isnan(agent.log_alpha.grad).any():
+                        print("NaN detected in alpha gradient, skipping alpha update")
+                    else:
+                        agent.optimizer.step()
+                    
+                    # Total gradient norm for logging
+                    grad_norm = critic_grad_norm + actor_grad_norm + alpha_grad_norm
+                    
+                    # Print gradient norms for debugging
+                    print(f"Gradient norms - Critic: {critic_grad_norm:.4f}, Actor: {actor_grad_norm:.4f}, Alpha: {alpha_grad_norm:.4f}")
+                    
+                    # Update target networks
                     agent.update_targets()
+                    
+                    # Monitor parameter values for debugging
+                    with torch.no_grad():
+                        for name, param in agent.named_parameters():
+                            if torch.isnan(param).any():
+                                print(f"NaN detected in parameter {name}")
                     
                     # Accumulate metrics
                     epoch_metrics['critic_loss'] += critic_loss.item()
