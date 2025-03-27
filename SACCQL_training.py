@@ -196,11 +196,25 @@ class ReplayBuffer:
 # Training Core
 # --------------------------
 
-def train_sac(dataset_path, epochs=500, batch_size=512, save_path='pure_sac.pth', log_dir="sac_logs"):
-    """Enhanced training loop with detailed logging"""
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models/pure_sac.pth', log_dir="logs/sac"):
+    """Enhanced training loop with detailed logging
     
-    # Create log directory
+    Args:
+        dataset_path: Path to the training dataset CSV
+        epochs: Number of training epochs
+        batch_size: Batch size for training
+        save_path: Path to save the trained model
+        log_dir: Directory to save training logs
+        
+    Returns:
+        Trained SAC agent
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Training on device: {device}")
+    
+    # Create model and log directories
+    model_dir = os.path.dirname(save_path)
+    Path(model_dir).mkdir(parents=True, exist_ok=True)
     Path(log_dir).mkdir(parents=True, exist_ok=True)
     log_path = Path(log_dir) / "training_log.csv"
     
@@ -354,16 +368,43 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='pure_sac.pth'
                 
                 # Save checkpoint
                 if (epoch+1) % 50 == 0:
-                    checkpoint_path = f"{os.path.splitext(save_path)[0]}_epoch{epoch+1}.pth"
-                    torch.save(agent.state_dict(), checkpoint_path)
+                    checkpoint_dir = os.path.join(os.path.dirname(save_path), "checkpoints")
+                    Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+                    checkpoint_path = os.path.join(checkpoint_dir, f"sac_epoch{epoch+1}.pth")
+                    
+                    # Save both model weights and training metadata
+                    torch.save({
+                        'epoch': epoch + 1,
+                        'model_state_dict': agent.state_dict(),
+                        'optimizer_state_dict': agent.optimizer.state_dict(),
+                        'critic_loss': log_entry['critic_loss'],
+                        'actor_loss': log_entry['actor_loss'],
+                    }, checkpoint_path)
+                    print(f"Checkpoint saved to {checkpoint_path}")
     
-    # Save final model
-    torch.save(agent.state_dict(), save_path)
+    # Save final model with metadata
+    torch.save({
+        'epoch': epochs,
+        'model_state_dict': agent.state_dict(),
+        'optimizer_state_dict': agent.optimizer.state_dict(),
+        'model_type': 'SAC',
+        'state_dim': 8,
+        'action_dim': 2,
+        'training_dataset': os.path.basename(dataset_path),
+    }, save_path)
     print(f"Training complete. Model saved to {save_path}")
     return agent
 
-def analyze_training_log(log_path="training_logs/training_log.csv", output_dir="training_analysis"):
-    """Analyze training log and generate visualizations"""
+def analyze_training_log(log_path="logs/sac/training_log.csv", output_dir="logs/sac/analysis"):
+    """Analyze training log and generate visualizations
+    
+    Args:
+        log_path: Path to the training log CSV file
+        output_dir: Directory to save analysis visualizations
+        
+    Returns:
+        None, but saves visualization files to output_dir
+    """
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     
     # Read log data
@@ -408,9 +449,9 @@ if __name__ == "__main__":
                         help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=512,
                         help='Batch size for training')
-    parser.add_argument('--save_path', type=str, default="sac_model.pth", 
+    parser.add_argument('--save_path', type=str, default="models/sac_model.pth", 
                         help='Path to save the trained model')
-    parser.add_argument('--log_dir', type=str, default="training_logs", 
+    parser.add_argument('--log_dir', type=str, default="logs/sac", 
                         help='Directory to save training logs')
     
     args = parser.parse_args()
@@ -426,6 +467,6 @@ if __name__ == "__main__":
     
     # Analyze training results
     analyze_training_log(
-        log_path="training_logs/training_log.csv",
-        output_dir="training_analysis"
+        log_path=os.path.join(args.log_dir, "training_log.csv"),
+        output_dir=os.path.join(args.log_dir, "analysis")
     )

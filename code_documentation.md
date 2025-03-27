@@ -1,188 +1,94 @@
-# Diabetes Management RL: Critical Analysis & Simplifications
+# SAC-CQL for Diabetes Management
 
-## Current Architecture Critique
+## Overview
 
-### 1. Algorithm Choice (CQL+SAC)
-- **Original Justification**:
-  - Combines SAC's entropy maximization with CQL's conservatism
-  - Meant to handle distributional shift in offline RL
-- **Actual Issues**:
-  - Complex loss landscape from competing objectives
-  - CQL penalty dominates learning dynamics
-  - Difficult hyperparameter tuning (α, CQL weight, τ)
-- **Simplification Potential**:
-  - Use vanilla SAC with behavioral cloning regularization
-  - Add dropout instead of CQL for uncertainty estimation
-  - Use simpler TD3 algorithm with noise injection
+This repository contains an implementation of Soft Actor-Critic (SAC) with Conservative Q-Learning (CQL) for automated insulin delivery in diabetes management. The system learns insulin dosing strategies from historical data to maintain blood glucose levels within a healthy range.
 
-### 2. Network Architecture
-- **Original Choices**:
-  - 3-layer networks with BatchNorm
-  - Twin Q-networks with LayerNorm
-  - Separate advantage head
-- **Identified Problems**:
-  - BatchNorm causes unstable gradients
-  - Overparameterization for small action space
-  - Advantage head creates conflicting gradients
-- **Simpler Alternative**:
-  ```python
-  class SimpleActor(nn.Module):
-      def __init__(self):
-          super().__init__()
-          self.net = nn.Sequential(
-              nn.Linear(8, 64),
-              nn.ReLU(),
-              nn.Linear(64, 2),
-              nn.Tanh()  # Constrained action output
-          )
-  ```
+## Model Architecture
 
-### 3. Entropy Management
-- **Current Complexity**:
-  - Learnable α parameter
-  - Entropy clamping and scaling
-  - Target entropy scheduling
-- **Simpler Approach**:
-  - Fixed temperature (α=0.2)
-  - Remove entropy from actor loss
-  - Use behavioral cloning regularization instead
+The implementation uses a Soft Actor-Critic (SAC) architecture with the following components:
 
-## Proposed Simplified Algorithm
+- **Actor Network**: Produces insulin dosing actions (basal rates and boluses)
+- **Twin Q-Networks**: Estimate action values with reduced overestimation bias
+- **Entropy Regularization**: Encourages exploration during training
 
-### Basic Offline SAC
-- **Key Differences**:
-  1. Remove CQL penalty
-  2. Single Q-network
-  3. Fixed entropy coefficient
-  4. Add behavioral cloning loss
+### State Space (8 dimensions)
+- Current glucose level (mg/dL)
+- Glucose rate of change (mg/dL/min)
+- Glucose acceleration (mg/dL/min²)
+- Heart rate (bpm)
+- Heart rate derivative (bpm/min)
+- Heart rate acceleration (bpm/min²)
+- Insulin on board (IOB) (units)
+- Hour of day (0-23)
 
-| Component          | Original          | Simplified       |
-|--------------------|-------------------|------------------|
-| Q-Networks         | Twin + LayerNorm  | Single + ReLU    |
-| Policy Update      | CQL + Entropy     | BC Regularized   |
-| Exploration        | Learned α         | Fixed α=0.2      |
-| Params (Actor)     | 500k+             | <10k             |
+### Action Space (2 dimensions)
+- Basal insulin rate (U/hr)
+- Bolus insulin dose (U)
 
-**basic_offline_training.py**:
-```python
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from helpers import DiabetesDataset, device
+### Reward Function
+The reward function is based on the blood glucose risk index, which penalizes both hyperglycemia and hypoglycemia, with stronger penalties for dangerous hypoglycemic events.
 
-class SimpleSAC(nn.Module):
-    def __init__(self):
-        super().__init__()
-        # Actor
-        self.actor = nn.Sequential(
-            nn.Linear(8, 64),
-            nn.ReLU(),
-            nn.Linear(64, 2),
-            nn.Tanh()
-        )
-        
-        # Critic
-        self.critic = nn.Sequential(
-            nn.Linear(10, 64),  # state + action
-            nn.ReLU(),
-            nn.Linear(64, 1)
-        )
-        
-        self.critic_target = nn.Sequential(
-            nn.Linear(10, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
-        )
-        self.critic_target.load_state_dict(self.critic.state_dict())
+## Training Process
 
-    def act(self, state):
-        return self.actor(state)
+The training process uses historical diabetes management data to learn optimal insulin dosing strategies:
 
-def train_basic(dataset_path, epochs=100, lr=3e-4, batch_size=256):
-    # Data
-    dataset = DiabetesDataset(dataset_path)
-    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    
-    # Model
-    model = SimpleSAC().to(device)
-    opt = optim.Adam(model.parameters(), lr=lr)
-    
-    # Fixed hyperparams
-    gamma = 0.99
-    alpha = 0.2  # Fixed entropy coeff
-    tau = 0.01
-    
-    for epoch in range(epochs):
-        for batch in loader:
-            states = batch["state"].to(device)
-            actions = batch["action"].to(device)
-            rewards = batch["reward"].to(device)
-            next_states = batch["next_state"].to(device)
-            dones = batch["done"].to(device)
-            
-            # Critic Update
-            with torch.no_grad():
-                next_actions = model.actor(next_states)
-                target_q = rewards + (1 - dones) * gamma * model.critic_target(
-                    torch.cat([next_states, next_actions], 1))
-            
-            current_q = model.critic(torch.cat([states, actions], 1))
-            critic_loss = ((current_q - target_q)**2).mean()
-            
-            # Behavioral Cloning
-            bc_loss = ((model.actor(states) - actions)**2).mean()
-            
-            # Total Loss
-            loss = critic_loss + 0.1 * bc_loss
-            
-            opt.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-            
-            # Target Update
-            with torch.no_grad():
-                for t, m in zip(model.critic_target.parameters(), model.critic.parameters()):
-                    t.data.copy_(tau * m.data + (1 - tau) * t.data)
-    
-    torch.save(model.state_dict(), "basic_sac.pth")
+1. **Data Preprocessing**: Handles missing values and computes derived features
+2. **Batch Training**: Uses mini-batch gradient descent with experience replay
+3. **Soft Target Updates**: Gradually updates target networks for stability
+4. **Entropy Regularization**: Automatically tunes exploration-exploitation balance
 
-if __name__ == "__main__":
-    train_basic(
-        dataset_path="datasets/processed/563-train.csv",
-        epochs=100,
-        lr=3e-4,
-        batch_size=256
-    )
+### Hyperparameters
+
+Key hyperparameters include:
+- Learning rates: 1e-5 (actor), 3e-4 (critics)
+- Batch size: 512
+- Discount factor: 0.99
+- Target network update rate: 0.05
+- Weight decay: 1e-4
+
+## Evaluation Metrics
+
+The model is evaluated on several metrics:
+
+- **Time in Range (TIR)**: Percentage of time glucose is between 70-180 mg/dL
+- **Mean Absolute Error (MAE)**: Average absolute difference between predicted and actual insulin doses
+- **Root Mean Square Error (RMSE)**: Root of the mean squared difference between predicted and actual insulin doses
+- **Hypoglycemia Rate**: Percentage of time glucose is below 70 mg/dL
+- **Severe Hypoglycemia Rate**: Percentage of time glucose is below 54 mg/dL
+
+## Usage
+
+### Training
+
+```bash
+python SACCQL_training.py --dataset datasets/processed/563-train.csv --epochs 500 --batch_size 512 --save_path models/sac_model.pth --log_dir logs/sac
 ```
 
-## Key Simplifications
+### Testing
 
-1. **Algorithm**:
-   - Removed CQL complexity
-   - Single critic network
-   - Fixed entropy coefficient
-   - Added behavioral cloning regularization
+```bash
+python SACCQL_testing.py --model models/sac_model.pth --test_data datasets/processed/563-test.csv --output_dir logs/evaluation
+```
 
-2. **Architecture**:
-   - 2-layer networks instead of 3
-   - ReLU instead of LeakyReLU/SiLU
-   - No normalization layers
-   - 10x fewer parameters
+## Results Analysis
 
-3. **Training**:
-   - Single optimizer
-   - No entropy adaptation
-   - Simple TD error + BC loss
+The training and evaluation processes generate various visualizations:
 
-## Tradeoffs
+- Training metrics over time
+- Action distribution comparisons
+- Glucose distribution analysis
+- State-action heatmaps
+- Reward distribution
 
-| Aspect          | Original                   | Simplified          |
-|-----------------|----------------------------|---------------------|
-| OOD Prevention  | Strong (CQL)               | Weak (BC only)      |
-| Stability       | High variance              | More stable         |
-| Training Speed  | 10 min/epoch               | 1 min/epoch         |
-| Performance     | Theoretically better       | Practically usable  |
-| Tuning Effort   | High                       | Low                 |
+These visualizations help understand model behavior and identify potential improvements.
 
-**Recommendation**: Start with the simplified version to establish baseline performance, then gradually reintroduce complexity only where needed. The simplified version should train successfully within 1 hour and provide actionable insights.
+## Implementation Details
+
+The implementation includes several techniques for improved stability and performance:
+
+- Gradient clipping to prevent exploding gradients
+- Layer normalization in the actor network
+- Dynamic learning rate scheduling
+- Twin Q-networks to reduce overestimation bias
+- Proper entropy calculation and regularization
