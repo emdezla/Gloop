@@ -101,7 +101,8 @@ class SACAgent(nn.Module):
             nn.Tanh()
         )
         self.mean = nn.Linear(64, action_dim)
-        self.log_std = nn.Parameter(torch.full((1, action_dim), -0.5))  # Higher initial std
+        self.log_std = nn.Parameter(torch.zeros(1, action_dim))  # Start from neutral
+        self.log_alpha = nn.Parameter(torch.tensor([0.0]))  # Learnable temperature parameter
         self.action_scale = 1.0
         
         # Initialize weights properly
@@ -125,9 +126,10 @@ class SACAgent(nn.Module):
         
         # Different learning rates for different components
         self.optimizer = optim.AdamW([
-            {'params': self.actor.parameters(), 'lr': 3e-5},  # Slower actor
-            {'params': self.mean.parameters(), 'lr': 3e-5},
-            {'params': self.log_std, 'lr': 1e-4},
+            {'params': self.actor.parameters(), 'lr': 1e-4},
+            {'params': self.mean.parameters(), 'lr': 1e-4},
+            {'params': self.log_std, 'lr': 3e-5},  # Slower std updates
+            {'params': self.log_alpha, 'lr': 3e-5},  # Slow alpha updates
             {'params': self.q1.parameters(), 'lr': 3e-4},  # Faster critics
             {'params': self.q2.parameters(), 'lr': 3e-4}
         ], weight_decay=1e-4)
@@ -149,7 +151,7 @@ class SACAgent(nn.Module):
         """Action selection with entropy regularization"""
         hidden = self.actor(state)
         mean = self.mean(hidden)
-        log_std = torch.clamp(self.log_std, -5, 2)  # Constrained log_std
+        log_std = torch.clamp(self.log_std, min=-2, max=0)  # Tighter bounds (std between 0.13 and 1.0)
         return mean, log_std
 
     def act(self, state, deterministic=False):
@@ -264,16 +266,16 @@ def train_sac(dataset_path, epochs=200, batch_size=256, save_path='sac_model.pth
                     dist = torch.distributions.Normal(mean, std)
                     action_samples = torch.tanh(dist.rsample()) * agent.action_scale  # Add action scaling
                     
-                    # Entropy calculation
-                    entropy = dist.entropy().mean()
+                    # Proper Gaussian entropy calculation
+                    entropy = 0.5 * (1.0 + torch.log(2 * torch.tensor(np.pi)) + 2 * log_std).mean()
                     
                     # Use adaptive entropy regularization
-                    target_entropy = -torch.prod(torch.Tensor([2.0])).item()  # For 2D action space
-                    alpha = torch.exp(agent.log_std).mean().detach()
+                    target_entropy = -torch.tensor(2).item()  # -2 for 2D actions
+                    alpha = torch.exp(agent.log_alpha).detach()
                     
                     # Q-values for policy with entropy regularization
                     q1_policy = agent.q1(torch.cat([states, action_samples], 1))
-                    actor_loss = -q1_policy.mean() + alpha * (entropy - target_entropy).mean()
+                    actor_loss = -q1_policy.mean() + 0.2 * (target_entropy - entropy).mean()
                     
                     # Combined update
                     total_loss = critic_loss + actor_loss
