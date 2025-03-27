@@ -9,6 +9,9 @@ import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 import os
+import csv
+import matplotlib.pyplot as plt
+from pathlib import Path
 from tqdm import tqdm
 
 # --------------------------
@@ -147,80 +150,169 @@ class SACAgent(nn.Module):
 # Training Core
 # --------------------------
 
-def train_sac(dataset_path, epochs=200, batch_size=256, save_path='sac_model.pth'):
-    """Simplified training loop for SAC agent"""
+def train_sac(dataset_path, epochs=200, batch_size=256, save_path='sac_model.pth', log_dir="training_logs"):
+    """Enhanced training loop with detailed logging"""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Create log directory
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    log_path = Path(log_dir) / "training_log.csv"
     
     # Initialize components
     dataset = DiabetesDataset(dataset_path)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     agent = SACAgent().to(device)
     
-    with tqdm(range(epochs), desc="Training") as pbar:
-        for epoch in pbar:
-            epoch_loss = 0
-            
-            for batch in dataloader:
-                # Prepare batch
-                states = batch['state'].to(device)
-                actions = batch['action'].to(device)
-                rewards = batch['reward'].to(device)
-                next_states = batch['next_state'].to(device)
-                dones = batch['done'].to(device)
+    # Initialize CSV logger
+    fieldnames = [
+        'epoch', 'critic_loss', 'actor_loss', 
+        'q1_value', 'q2_value', 'action_mean', 
+        'action_std', 'entropy', 'grad_norm'
+    ]
+    
+    with open(log_path, 'w', newline='') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+
+        with tqdm(range(epochs), desc="Training") as pbar:
+            for epoch in pbar:
+                epoch_metrics = {
+                    'critic_loss': 0.0,
+                    'actor_loss': 0.0,
+                    'q1_value': 0.0,
+                    'q2_value': 0.0,
+                    'action_mean': 0.0,
+                    'action_std': 0.0,
+                    'entropy': 0.0,
+                    'grad_norm': 0.0,
+                }
                 
-                # Critic update
-                with torch.no_grad():
-                    next_actions = agent.act(next_states)
-                    q1_next = agent.q1_target(torch.cat([next_states, next_actions], 1))
-                    q2_next = agent.q2_target(torch.cat([next_states, next_actions], 1))
-                    target_q = rewards + 0.99 * (1 - dones) * torch.min(q1_next, q2_next)
+                for batch in dataloader:
+                    # Prepare batch
+                    states = batch['state'].to(device)
+                    actions = batch['action'].to(device)
+                    rewards = batch['reward'].to(device)
+                    next_states = batch['next_state'].to(device)
+                    dones = batch['done'].to(device)
+                    
+                    # Critic update
+                    with torch.no_grad():
+                        next_actions = agent.act(next_states)
+                        q1_next = agent.q1_target(torch.cat([next_states, next_actions], 1))
+                        q2_next = agent.q2_target(torch.cat([next_states, next_actions], 1))
+                        target_q = rewards + 0.99 * (1 - dones) * torch.min(q1_next, q2_next)
+                    
+                    # Current Q estimates
+                    current_q1 = agent.q1(torch.cat([states, actions], 1))
+                    current_q2 = agent.q2(torch.cat([states, actions], 1))
+                    
+                    # TD loss
+                    critic_loss = nn.MSELoss()(current_q1, target_q) + nn.MSELoss()(current_q2, target_q)
+                    
+                    # Actor update
+                    mean, log_std = agent.forward(states)
+                    std = log_std.exp()
+                    dist = torch.distributions.Normal(mean, std)
+                    action_samples = torch.tanh(dist.rsample())
+                    
+                    # Entropy calculation
+                    entropy = dist.entropy().mean()
+                    
+                    # Q-values for policy
+                    q1_policy = agent.q1(torch.cat([states, action_samples], 1))
+                    actor_loss = -q1_policy.mean()
+                    
+                    # Combined update
+                    total_loss = critic_loss + actor_loss
+                    agent.optimizer.zero_grad()
+                    total_loss.backward()
+                    
+                    # Gradient monitoring
+                    grad_norm = torch.nn.utils.clip_grad_norm_(agent.parameters(), 1.0)
+                    
+                    agent.optimizer.step()
+                    agent.update_targets()
+                    
+                    # Accumulate metrics
+                    epoch_metrics['critic_loss'] += critic_loss.item()
+                    epoch_metrics['actor_loss'] += actor_loss.item()
+                    epoch_metrics['q1_value'] += current_q1.mean().item()
+                    epoch_metrics['q2_value'] += current_q2.mean().item()
+                    epoch_metrics['action_mean'] += action_samples.mean().item()
+                    epoch_metrics['action_std'] += action_samples.std().item()
+                    epoch_metrics['entropy'] += entropy.item()
+                    epoch_metrics['grad_norm'] += grad_norm.item()
                 
-                # Current Q estimates
-                current_q1 = agent.q1(torch.cat([states, actions], 1))
-                current_q2 = agent.q2(torch.cat([states, actions], 1))
+                # Average metrics over batches
+                num_batches = len(dataloader)
+                log_entry = {
+                    'epoch': epoch + 1,
+                    'critic_loss': epoch_metrics['critic_loss'] / num_batches,
+                    'actor_loss': epoch_metrics['actor_loss'] / num_batches,
+                    'q1_value': epoch_metrics['q1_value'] / num_batches,
+                    'q2_value': epoch_metrics['q2_value'] / num_batches,
+                    'action_mean': epoch_metrics['action_mean'] / num_batches,
+                    'action_std': epoch_metrics['action_std'] / num_batches,
+                    'entropy': epoch_metrics['entropy'] / num_batches,
+                    'grad_norm': epoch_metrics['grad_norm'] / num_batches,
+                }
                 
-                # TD loss
-                critic_loss = nn.MSELoss()(current_q1, target_q) + nn.MSELoss()(current_q2, target_q)
+                writer.writerow(log_entry)
                 
-                # Actor update
-                mean, log_std = agent.forward(states)
-                std = log_std.exp()
-                dist = torch.distributions.Normal(mean, std)
-                action_samples = torch.tanh(dist.rsample())
+                # Update progress bar
+                pbar.set_postfix({
+                    'Critic Loss': f"{log_entry['critic_loss']:.3f}",
+                    'Actor Loss': f"{log_entry['actor_loss']:.3f}",
+                    'Q Values': f"{(log_entry['q1_value'] + log_entry['q2_value'])/2:.3f}"
+                })
                 
-                # Q-values for policy
-                q1_policy = agent.q1(torch.cat([states, action_samples], 1))
-                actor_loss = -q1_policy.mean()
-                
-                # Combined update
-                total_loss = critic_loss + actor_loss
-                agent.optimizer.zero_grad()
-                total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(agent.parameters(), 1.0)
-                agent.optimizer.step()
-                
-                # Update target networks
-                agent.update_targets()
-                
-                epoch_loss += total_loss.item()
-            
-            # Update progress bar
-            pbar.set_postfix({'Loss': f"{epoch_loss/len(dataloader):.3f}"})
-            
-            # Save checkpoint
-            if (epoch+1) % 50 == 0:
-                checkpoint_path = f"{os.path.splitext(save_path)[0]}_epoch{epoch+1}.pth"
-                torch.save(agent.state_dict(), checkpoint_path)
+                # Save checkpoint
+                if (epoch+1) % 50 == 0:
+                    checkpoint_path = f"{os.path.splitext(save_path)[0]}_epoch{epoch+1}.pth"
+                    torch.save(agent.state_dict(), checkpoint_path)
     
     # Save final model
     torch.save(agent.state_dict(), save_path)
     print(f"Training complete. Model saved to {save_path}")
     return agent
 
+def analyze_training_log(log_path="training_logs/training_log.csv", output_dir="training_analysis"):
+    """Analyze training log and generate visualizations"""
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    
+    # Read log data
+    df = pd.read_csv(log_path)
+    
+    # Create subplots
+    fig, axs = plt.subplots(3, 3, figsize=(18, 12))
+    fig.suptitle('Training Metrics Analysis', fontsize=16)
+    
+    # Plot each metric
+    metrics = [col for col in df.columns if col != 'epoch']
+    for idx, metric in enumerate(metrics):
+        ax = axs[idx//3, idx%3]
+        ax.plot(df['epoch'], df[metric])
+        ax.set_title(metric.replace('_', ' ').title())
+        ax.set_xlabel('Epoch')
+        ax.grid(True)
+    
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(Path(output_dir) / "training_metrics.png")
+    plt.close()
+    
+    print(f"Analysis plots saved to {output_dir}")
+
 if __name__ == "__main__":
     # Example usage
     agent = train_sac(
         dataset_path="datasets/processed/563-train.csv",
         epochs=200,
-        save_path="sac_model.pth"
+        save_path="sac_model.pth",
+        log_dir="training_logs"
+    )
+    
+    # Analyze training results
+    analyze_training_log(
+        log_path="training_logs/training_log.csv",
+        output_dir="training_analysis"
     )
