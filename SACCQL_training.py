@@ -259,6 +259,10 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', lr_w
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Training on device: {device}")
     
+    # Generate timestamp once at start of training
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    save_path = os.path.join(save_path, timestamp)
+    
     # Initialize components
     dataset = DiabetesDataset(dataset_path)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -270,8 +274,8 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', lr_w
     initial_alpha_lr = 3e-5
     
     # Add logging setup
-    log_dir = Path("training_logs")
-    log_dir.mkdir(exist_ok=True)
+    log_dir = Path("training_logs") / timestamp
+    log_dir.mkdir(exist_ok=True, parents=True)
     log_path = log_dir / "training_log.csv"
     
     with open(log_path, 'w', newline='') as f:
@@ -447,13 +451,13 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', lr_w
             # Save checkpoint every 50 epochs
             if (epoch+1) % 50 == 0:
                 Path(save_path).mkdir(parents=True, exist_ok=True)
-                checkpoint_path = os.path.join(save_path, f"sac_checkpoint_epoch{epoch+1}.pth")
+                checkpoint_path = os.path.join(save_path, f"sac_checkpoint_epoch{epoch+1}_{timestamp}.pth")
                 torch.save(agent.state_dict(), checkpoint_path)
                 print(f"Checkpoint saved to {checkpoint_path}")
     
     # Save final model
     Path(save_path).mkdir(parents=True, exist_ok=True)
-    final_model_path = os.path.join(save_path, "sac_final_model.pth")
+    final_model_path = os.path.join(save_path, f"sac_final_model_{timestamp}.pth")
     torch.save(agent.state_dict(), final_model_path)
     print(f"Training complete. Model saved to {final_model_path}")
     return agent
@@ -463,7 +467,7 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', lr_w
 # Analysis & Reporting
 # --------------------------
 
-def analyze_training_log(log_path="training_logs/training_log.csv", output_dir="training_analysis"):
+def analyze_training_log(log_path, output_dir="training_analysis"):
     """Analyze training log and generate visualizations with clinical insights"""
     from pathlib import Path
     import pandas as pd
@@ -647,4 +651,5 @@ if __name__ == "__main__":
     )
     
     # Run analysis on training logs
-    analyze_training_log()
+    log_dir = Path("training_logs") / timestamp
+    analyze_training_log(log_path=log_dir / "training_log.csv")
