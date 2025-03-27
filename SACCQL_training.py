@@ -48,15 +48,15 @@ class DiabetesDataset(Dataset):
         self._sanitize_transitions()
 
     def _compute_rewards(self, glucose_next):
-        """Properly scaled rewards"""
+        """Improved reward scaling"""
         glucose_next = np.clip(glucose_next, 40, 400)
         with np.errstate(invalid='ignore'):
-            log_term = np.log(glucose_next/180.0)  # Normalize to typical glucose
-            risk_index = 10 * (1.509 * (log_term**1.084 - 1.861))**2
+            log_term = np.log(glucose_next/180.0)
+            risk_index = 10 * (1.509 * (log_term**1.084 - 1.861)**2)
         
-        # Scale rewards to [-1, 0] range
-        rewards = -np.tanh(risk_index/100)  # Changed from sigmoid to tanh scaling
-        rewards[glucose_next < 54] = -2.0  # Smaller penalty
+        # Better reward scaling using sigmoid instead of tanh
+        rewards = -1 / (1 + np.exp(-risk_index/50))  # Scaled to (-1, 0)
+        rewards[glucose_next < 54] = -5.0  # Stronger hypo penalty
         return rewards.astype(np.float32)
 
     def _sanitize_transitions(self):
@@ -123,13 +123,13 @@ class SACAgent(nn.Module):
         self.q1_target.load_state_dict(self.q1.state_dict())
         self.q2_target.load_state_dict(self.q2.state_dict())
         
-        # Optimizer with weight decay for regularization
+        # Different learning rates for different components
         self.optimizer = optim.AdamW([
-            {'params': self.actor.parameters(), 'lr': 1e-4},
-            {'params': self.mean.parameters(), 'lr': 1e-4},
+            {'params': self.actor.parameters(), 'lr': 3e-5},  # Slower actor
+            {'params': self.mean.parameters(), 'lr': 3e-5},
             {'params': self.log_std, 'lr': 1e-4},
-            {'params': self.q1.parameters(), 'lr': 1e-4},  # Lower Q-learning rate
-            {'params': self.q2.parameters(), 'lr': 1e-4}   # Lower Q-learning rate
+            {'params': self.q1.parameters(), 'lr': 3e-4},  # Faster critics
+            {'params': self.q2.parameters(), 'lr': 3e-4}
         ], weight_decay=1e-4)
         
         # Learning rate scheduler
@@ -172,6 +172,24 @@ class SACAgent(nn.Module):
                 target.data.copy_(tau * source.data + (1 - tau) * target.data)
 
 # --------------------------
+# Experience Replay Buffer
+# --------------------------
+
+class ReplayBuffer:
+    def __init__(self, capacity=100000):
+        self.buffer = []
+        self.capacity = capacity
+        
+    def add(self, transition):
+        if len(self.buffer) >= self.capacity:
+            self.buffer.pop(0)
+        self.buffer.append(transition)
+            
+    def sample(self, batch_size):
+        indices = np.random.choice(len(self.buffer), batch_size)
+        return [self.buffer[i] for i in indices]
+
+# --------------------------
 # Training Core
 # --------------------------
 
@@ -192,7 +210,8 @@ def train_sac(dataset_path, epochs=200, batch_size=256, save_path='sac_model.pth
     fieldnames = [
         'epoch', 'critic_loss', 'actor_loss', 
         'q1_value', 'q2_value', 'action_mean', 
-        'action_std', 'entropy', 'grad_norm'
+        'action_std', 'entropy', 'grad_norm',
+        'log_std_mean', 'alpha', 'lr'
     ]
     
     with open(log_path, 'w', newline='') as csvfile:
@@ -227,10 +246,10 @@ def train_sac(dataset_path, epochs=200, batch_size=256, save_path='sac_model.pth
                         next_actions = agent.act(next_states)
                         q1_next = agent.q1_target(torch.cat([next_states, next_actions], 1))
                         q2_next = agent.q2_target(torch.cat([next_states, next_actions], 1))
-                        # Clip target values for stability
+                        # Change from hard clipping to relative clipping
                         q_next = torch.min(q1_next, q2_next)
                         target_q = rewards + 0.99 * (1 - dones) * q_next
-                        target_q = torch.clamp(target_q, -10.0, 0.0)  # Tighter value clipping
+                        target_q = torch.clamp(target_q, -5.0, current_q1.detach().mean() + 5.0)  # Dynamic range
                     
                     # Current Q estimates
                     current_q1 = agent.q1(torch.cat([states, actions], 1))
@@ -248,9 +267,13 @@ def train_sac(dataset_path, epochs=200, batch_size=256, save_path='sac_model.pth
                     # Entropy calculation
                     entropy = dist.entropy().mean()
                     
+                    # Use adaptive entropy regularization
+                    target_entropy = -torch.prod(torch.Tensor([2.0])).item()  # For 2D action space
+                    alpha = torch.exp(agent.log_std).mean().detach()
+                    
                     # Q-values for policy with entropy regularization
                     q1_policy = agent.q1(torch.cat([states, action_samples], 1))
-                    actor_loss = -q1_policy.mean() + 0.1 * entropy  # Reduced entropy coefficient
+                    actor_loss = -q1_policy.mean() + alpha * (entropy - target_entropy).mean()
                     
                     # Combined update
                     total_loss = critic_loss + actor_loss
@@ -302,6 +325,9 @@ def train_sac(dataset_path, epochs=200, batch_size=256, save_path='sac_model.pth
                     'action_std': epoch_metrics['action_std'] / num_batches,
                     'entropy': epoch_metrics['entropy'] / num_batches,
                     'grad_norm': epoch_metrics['grad_norm'] / num_batches,
+                    'log_std_mean': agent.log_std.mean().item(),
+                    'alpha': torch.exp(agent.log_std).mean().item(),
+                    'lr': agent.optimizer.param_groups[0]['lr']
                 }
                 
                 writer.writerow(log_entry)
