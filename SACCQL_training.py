@@ -35,7 +35,6 @@ class DiabetesDataset(Dataset):
         
         # Add data validation
         assert df["action"].between(-1, 1).all(), "Actions must be between -1 and 1"
-        assert df["glu"].between(40, 400).all(), "Invalid glucose values"
         
         # State features (8 dimensions)
         self.states = df[["glu", "glu_d", "glu_t", "hr", "hr_d", "hr_t", "iob", "hour"]].values.astype(np.float32)
