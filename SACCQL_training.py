@@ -26,6 +26,19 @@ class DiabetesDataset(Dataset):
     def __init__(self, csv_file):
         df = pd.read_csv(csv_file)
         
+        # Add explicit glu_raw validation
+        if df["glu_raw"].isna().any():
+            print("NaN values in glu_raw - filling with forward/backward fill")
+            df["glu_raw"] = df["glu_raw"].ffill().bfill()
+            if df["glu_raw"].isna().any():
+                raise ValueError("glu_raw contains NaNs that couldn't be filled")
+
+        # Add bounds check for glu_raw
+        glu_raw = df["glu_raw"].values
+        if np.any(glu_raw < 40) or np.any(glu_raw > 400):
+            print("Warning: glu_raw contains values outside clinical range 40-400 mg/dL")
+            print(f"Min: {np.nanmin(glu_raw)}, Max: {np.nanmax(glu_raw)}")
+            
         # Handle missing values by forward-filling and backward-filling
         df = df.ffill().bfill()
         
@@ -53,23 +66,51 @@ class DiabetesDataset(Dataset):
         self._sanitize_transitions()
 
     def _compute_rewards(self, glucose_next):
-        """Safer reward scaling"""
-        glucose_next = np.clip(glucose_next, 40, 400)
+        """Robust reward calculation with numerical safeguards"""
+        # Add debug output for first 5 values
+        print(f"Sample glu_raw inputs: {glucose_next[:5]}")
+        
+        # Convert to numpy array explicitly
+        glucose_next = np.asarray(glucose_next, dtype=np.float32)
+        
+        # Handle remaining NaNs if any
+        if np.isnan(glucose_next).any():
+            print("Warning: NaN in glucose_next - replacing with 180 (nominal)")
+            glucose_next = np.nan_to_num(glucose_next, nan=180.0)
+
+        # Safer clipping with type preservation
+        glucose_next = np.clip(glucose_next.astype(np.float32), 40, 400)
+        
+        # Stable log calculation
+        safe_ratio = np.where(
+            glucose_next > 0,
+            glucose_next / 180.0,
+            1e-4  # Avoid zero division
+        )
+        log_term = np.log(safe_ratio + 1e-8)
+        
+        # Vectorized risk calculation
         with np.errstate(invalid='ignore'):
-            log_term = np.log(glucose_next/180.0 + 1e-8)  # Add epsilon to prevent log(0)
             risk_index = 10 * (1.509 * (log_term**1.084 - 1.861)**2)
+            risk_index = np.nan_to_num(risk_index, nan=50.0, posinf=50.0, neginf=0.0)
         
-        # More stable reward calculation
-        rewards = -risk_index / (risk_index + 50)  # Range [-1, 0]
-        rewards = np.clip(rewards, -5.0, 0.0)  # Hard clip
-        rewards[glucose_next < 54] = -5.0  # Stronger hypo penalty
+        # Reward calculation with failsafes
+        rewards = -risk_index / (np.clip(risk_index, 1e-8, None) + 50)  # Prevent div by zero
+        rewards = np.clip(rewards, -5.0, 0.0).astype(np.float32)
         
-        # Add reward validation
+        # Hypoglycemia penalty with index check
+        hypo_mask = glucose_next < 54
+        rewards[hypo_mask] = -5.0
+        
+        # Add debug output for first 5 rewards
+        print(f"Sample rewards: {rewards[:5]}")
+        
+        # Final validation
         if np.isnan(rewards).any():
             nan_indices = np.where(np.isnan(rewards))[0]
             raise ValueError(f"NaN rewards at indices: {nan_indices}")
             
-        return rewards.astype(np.float32)
+        return rewards
 
     def _sanitize_transitions(self):
         """Remove invalid transitions and align array lengths"""
