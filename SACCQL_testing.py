@@ -253,7 +253,7 @@ def evaluate_model(model, test_dataset, model_metadata=None, output_dir="logs/ev
             states_norm = (states - states.mean(0)) / (states.std(0) + 1e-8)
             
             # Get model predictions
-            actions_pred = model.act(states_norm, deterministic=True)
+            actions_pred = model.act(states_norm)  # Remove deterministic flag
             
             # Store for later analysis
             all_states.extend(states.cpu().numpy())
@@ -372,7 +372,7 @@ def test_noise_robustness(model, states, actions_true, device, noise_levels=[0.0
                 states_norm = (states_tensor - states_tensor.mean(0)) / (states_tensor.std(0) + 1e-8)
                 
                 # Get model predictions
-                actions_pred = model.act(states_norm, deterministic=True).cpu().numpy()
+                actions_pred = model.act(states_norm).cpu().numpy()  # Remove deterministic flag
                 
                 # Calculate RMSE
                 rmse = np.sqrt(mean_squared_error(actions_true, actions_pred))
