@@ -45,14 +45,14 @@ class DiabetesTestDataset(DiabetesDataset):
         hyper = np.sum((glucose_values > 180) & (glucose_values <= 250))
         severe_hyper = np.sum(glucose_values > 250)
         
-        # Calculate percentages
+        # Calculate percentages and convert numpy floats to Python floats
         return {
-            "severe_hypo_percent": 100 * severe_hypo / total_readings,
-            "hypo_percent": 100 * hypo / total_readings,
-            "normal_percent": 100 * normal / total_readings,
-            "hyper_percent": 100 * hyper / total_readings,
-            "severe_hyper_percent": 100 * severe_hyper / total_readings,
-            "time_in_range": 100 * normal / total_readings
+            "severe_hypo_percent": float(100 * severe_hypo / total_readings),
+            "hypo_percent": float(100 * hypo / total_readings),
+            "normal_percent": float(100 * normal / total_readings),
+            "hyper_percent": float(100 * hyper / total_readings),
+            "severe_hyper_percent": float(100 * severe_hyper / total_readings),
+            "time_in_range": float(100 * normal / total_readings)
         }
 
 def load_model(model_path):
@@ -104,6 +104,16 @@ def evaluate_model(model, test_dataset, output_dir="logs/evaluation"):
     """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     Path(output_dir).mkdir(parents=True, exist_ok=True)
+    
+    # Helper function to convert numpy types to native Python types for JSON
+    def convert_numpy(obj):
+        if isinstance(obj, np.generic):
+            return obj.item()
+        elif isinstance(obj, dict):
+            return {k: convert_numpy(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_numpy(v) for v in obj]
+        return obj
     
     # Initialize metrics
     metrics = {
@@ -177,9 +187,9 @@ def evaluate_model(model, test_dataset, output_dir="logs/evaluation"):
     # Add time in range metrics
     metrics.update(test_dataset.time_in_range)
     
-    # Save metrics to JSON
+    # Save metrics to JSON with numpy type conversion
     with open(os.path.join(output_dir, "evaluation_metrics.json"), "w") as f:
-        json.dump(metrics, f, indent=4)
+        json.dump(convert_numpy(metrics), f, indent=4)
     
     # Generate visualizations
     generate_evaluation_plots(

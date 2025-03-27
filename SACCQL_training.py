@@ -14,6 +14,7 @@ import csv
 import matplotlib.pyplot as plt
 from pathlib import Path
 from tqdm import tqdm
+from datetime import datetime
 
 # --------------------------
 # Data Handling
@@ -196,14 +197,14 @@ class ReplayBuffer:
 # Training Core
 # --------------------------
 
-def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models/pure_sac.pth', log_dir="logs/sac"):
+def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', log_dir="logs"):
     """Enhanced training loop with detailed logging
     
     Args:
         dataset_path: Path to the training dataset CSV
         epochs: Number of training epochs
         batch_size: Batch size for training
-        save_path: Path to save the trained model
+        save_path: Path to save the trained model directory
         log_dir: Directory to save training logs
         
     Returns:
@@ -212,11 +213,19 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models/pure_s
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Training on device: {device}")
     
-    # Create model and log directories
-    model_dir = os.path.dirname(save_path)
-    Path(model_dir).mkdir(parents=True, exist_ok=True)
-    Path(log_dir).mkdir(parents=True, exist_ok=True)
-    log_path = Path(log_dir) / "training_log.csv"
+    # Create unique timestamped directory
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"sac_model_{timestamp}"
+    
+    # Update paths to use timestamped directory
+    model_dir = Path(save_path) / run_name
+    model_dir.mkdir(parents=True, exist_ok=True)
+    
+    log_dir = Path(log_dir) / run_name
+    log_dir.mkdir(parents=True, exist_ok=True)
+    
+    final_model_path = model_dir / f"{run_name}.pth"
+    log_path = log_dir / "training_log.csv"
     
     # Initialize components
     dataset = DiabetesDataset(dataset_path)
@@ -368,9 +377,9 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models/pure_s
                 
                 # Save checkpoint
                 if (epoch+1) % 50 == 0:
-                    checkpoint_dir = os.path.join(os.path.dirname(save_path), "checkpoints")
-                    Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
-                    checkpoint_path = os.path.join(checkpoint_dir, f"sac_epoch{epoch+1}.pth")
+                    checkpoint_dir = model_dir / "checkpoints"
+                    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                    checkpoint_path = checkpoint_dir / f"checkpoint_epoch{epoch+1}.pth"
                     
                     # Save both model weights and training metadata
                     torch.save({
@@ -379,7 +388,7 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models/pure_s
                         'optimizer_state_dict': agent.optimizer.state_dict(),
                         'critic_loss': log_entry['critic_loss'],
                         'actor_loss': log_entry['actor_loss'],
-                    }, checkpoint_path)
+                    }, str(checkpoint_path))
                     print(f"Checkpoint saved to {checkpoint_path}")
     
     # Save final model with metadata
@@ -391,8 +400,8 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models/pure_s
         'state_dim': 8,
         'action_dim': 2,
         'training_dataset': os.path.basename(dataset_path),
-    }, save_path)
-    print(f"Training complete. Model saved to {save_path}")
+    }, str(final_model_path))
+    print(f"Training complete. Model saved to {final_model_path}")
     return agent
 
 def analyze_training_log(log_path="logs/sac/training_log.csv", output_dir="logs/sac/analysis"):
@@ -449,9 +458,9 @@ if __name__ == "__main__":
                         help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=512,
                         help='Batch size for training')
-    parser.add_argument('--save_path', type=str, default="models/sac_model.pth", 
-                        help='Path to save the trained model')
-    parser.add_argument('--log_dir', type=str, default="logs/sac", 
+    parser.add_argument('--save_path', type=str, default="models", 
+                        help='Directory to save the trained model')
+    parser.add_argument('--log_dir', type=str, default="logs", 
                         help='Directory to save training logs')
     
     args = parser.parse_args()
