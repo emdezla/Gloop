@@ -650,6 +650,16 @@ if __name__ == "__main__":
         lr_warmup_epochs=args.lr_warmup
     )
     
-    # Run analysis on training logs
-    log_dir = Path("training_logs") / timestamp
-    analyze_training_log(log_path=log_dir / "training_log.csv")
+    # Get the timestamp from the most recent directory in training_logs
+    training_logs_dir = Path("training_logs")
+    if training_logs_dir.exists():
+        # Find the most recent timestamp directory
+        timestamp_dirs = [d for d in training_logs_dir.iterdir() if d.is_dir()]
+        if timestamp_dirs:
+            latest_dir = max(timestamp_dirs, key=lambda x: x.stat().st_mtime)
+            # Run analysis on training logs
+            analyze_training_log(log_path=latest_dir / "training_log.csv")
+        else:
+            print("No training logs found to analyze")
+    else:
+        print("Training logs directory not found")
