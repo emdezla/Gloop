@@ -171,10 +171,15 @@ class SACAgent(nn.Module):
         self.q1_target.load_state_dict(self.q1.state_dict())
         self.q2_target.load_state_dict(self.q2.state_dict())
         
+        # Entropy regularization
+        self.target_entropy = -torch.prod(torch.Tensor([1])).item()  # For continuous action space
+        self.log_alpha = torch.tensor([0.0], requires_grad=True)
+        
         # Separate optimizers for actor and critic
-        self.actor_optim = optim.Adam(self.actor.parameters(), lr=1e-5)
+        self.actor_optim = optim.Adam(self.actor.parameters(), lr=3e-5)
         self.critic_optim = optim.Adam(
-            list(self.q1.parameters()) + list(self.q2.parameters()), lr=1e-4)
+            list(self.q1.parameters()) + list(self.q2.parameters()), lr=3e-5)
+        self.alpha_optim = optim.Adam([self.log_alpha], lr=1e-4)
 
     def _create_q_network(self, state_dim, action_dim):
         """Create more stable Q-network with gradient protections"""
@@ -198,7 +203,7 @@ class SACAgent(nn.Module):
         """Direct tanh output without scaling"""
         return torch.tanh(self.actor(state))
 
-    def update_targets(self, tau=0.05):  # Changed from 0.005 to 0.05
+    def update_targets(self, tau=0.01):  # Changed from 0.05 to 0.01
         """Soft target network updates"""
         with torch.no_grad():
             for target, source in zip(self.q1_target.parameters(), self.q1.parameters()):
@@ -248,6 +253,15 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models'):
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     agent = SACAgent().to(device)
     
+    # Add logging setup
+    log_dir = Path("training_logs")
+    log_dir.mkdir(exist_ok=True)
+    log_path = log_dir / "training_log.csv"
+    
+    with open(log_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['epoch', 'critic_loss', 'actor_loss', 'alpha_loss'])
+    
     with tqdm(range(epochs), desc="Training") as pbar:
         for epoch in pbar:
             epoch_critic_loss = 0.0
@@ -286,14 +300,28 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models'):
                 )
                 agent.critic_optim.step()
                 
-                # Actor update
+                # Actor update with entropy regularization
                 pred_actions = agent.act(states)
-                actor_loss = -agent.q1(torch.cat([states, pred_actions], 1)).mean()
+                q1_pred = agent.q1(torch.cat([states, pred_actions], 1))
+                q2_pred = agent.q2(torch.cat([states, pred_actions], 1))
+                
+                # Get current alpha value
+                alpha = agent.log_alpha.exp().detach()
+                
+                # Actor loss with entropy term
+                actor_loss = -(torch.min(q1_pred, q2_pred)).mean()
                 
                 agent.actor_optim.zero_grad()
                 actor_loss.backward()
                 torch.nn.utils.clip_grad_norm_(agent.actor.parameters(), 1.0)
                 agent.actor_optim.step()
+                
+                # Alpha (temperature) update
+                alpha_loss = -(agent.log_alpha * (agent.target_entropy + 0.1).detach()).mean()
+                
+                agent.alpha_optim.zero_grad()
+                alpha_loss.backward()
+                agent.alpha_optim.step()
                 
                 # Update target networks
                 agent.update_targets()
@@ -301,6 +329,7 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models'):
                 # Track losses
                 epoch_critic_loss += critic_loss.item()
                 epoch_actor_loss += actor_loss.item()
+                epoch_alpha_loss = alpha_loss.item() if 'alpha_loss' in locals() else 0.0
             
             # Average losses
             num_batches = len(dataloader)
@@ -310,8 +339,14 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models'):
             # Update progress bar
             pbar.set_postfix({
                 'Critic Loss': f"{epoch_critic_loss:.3f}",
-                'Actor Loss': f"{epoch_actor_loss:.3f}"
+                'Actor Loss': f"{epoch_actor_loss:.3f}",
+                'Alpha': f"{agent.log_alpha.exp().item():.3f}"
             })
+            
+            # Log metrics after each epoch
+            with open(log_path, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([epoch, epoch_critic_loss, epoch_actor_loss, epoch_alpha_loss])
             
             # Save checkpoint every 50 epochs
             if (epoch+1) % 50 == 0:
@@ -326,6 +361,51 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models'):
     torch.save(agent.state_dict(), final_model_path)
     print(f"Training complete. Model saved to {final_model_path}")
     return agent
+
+
+# --------------------------
+# Analysis & Reporting
+# --------------------------
+
+def analyze_training_log(log_path="training_logs/training_log.csv", output_dir="training_analysis"):
+    """Analyze training log and generate visualizations"""
+    from pathlib import Path
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    
+    # Read log data
+    df = pd.read_csv(log_path)
+    
+    # Create dynamic subplot grid
+    metrics = [col for col in df.columns if col != 'epoch']
+    n_metrics = len(metrics)
+    n_cols = 3
+    n_rows = (n_metrics + n_cols - 1) // n_cols  # Ceiling division
+    
+    fig, axs = plt.subplots(n_rows, n_cols, figsize=(18, 4*n_rows))
+    fig.suptitle('Training Metrics Analysis', fontsize=16)
+    
+    # Flatten axes array for easier iteration
+    axs = axs.flatten()
+    
+    for idx, metric in enumerate(metrics):
+        ax = axs[idx]
+        ax.plot(df['epoch'], df[metric])
+        ax.set_title(metric.replace('_', ' ').title())
+        ax.set_xlabel('Epoch')
+        ax.grid(True)
+    
+    # Hide empty subplots
+    for idx in range(n_metrics, len(axs)):
+        axs[idx].axis('off')
+    
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(Path(output_dir) / "training_metrics.png")
+    plt.close()
+    
+    print(f"Analysis plots saved to {output_dir}")
 
 
 if __name__ == "__main__":
@@ -350,3 +430,6 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         save_path=args.save_path
     )
+    
+    # Run analysis on training logs
+    analyze_training_log()
