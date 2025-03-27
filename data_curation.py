@@ -72,10 +72,10 @@ def evaluate_dataset_coverage(dataset, n_samples=1000):
     """Evaluate state and action coverage of DiabetesDataset"""
     # Convert to pandas DataFrame for easier analysis
     df = pd.DataFrame({
-        'state': [s.numpy() for s in dataset.states],
-        'action': [a.numpy() for a in dataset.actions],
-        'reward': dataset.rewards.numpy(),
-        'done': dataset.dones.numpy()
+        'state': dataset.states.tolist(),
+        'action': dataset.actions.tolist(),
+        'reward': dataset.rewards.tolist(),
+        'done': dataset.dones.tolist()
     })
     
     # Random sample for visualization
