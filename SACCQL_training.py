@@ -588,11 +588,11 @@ def generate_readiness_report(df, output_dir):
         f"- Total Epochs: {len(df)}",
         f"- Final Critic Loss: {df['critic_loss'].iloc[-1]:.4f}",
         f"- Final Actor Loss: {df['actor_loss'].iloc[-1]:.4f}",
-        f"- Final Entropy (α): {df['entropy'].iloc[-1]:.4f}",
+        f"- Final Entropy (alpha): {df['entropy'].iloc[-1]:.4f}",
         "",
         f"## Readiness Checklist",
         f"- {'✅' if critic_stable else '❌'} Critic loss stabilized for last 100 epochs (std={critic_loss_std:.4f})",
-        f"- {'✅' if alpha_maintained else '❌'} α > 0.1 maintained in final 20% of training",
+        f"- {'✅' if alpha_maintained else '❌'} alpha > 0.1 maintained in final 20% of training",
         f"- {'✅' if action_std_healthy else '❌'} Action std between 0.2-0.6 (current={df['action_std'].iloc[-1]:.4f})",
         f"- {'✅' if q_values_healthy else '❌'} Q-values within [-4.5, -0.5] range (Q1={df['q1_value'].iloc[-1]:.4f}, Q2={df['q2_value'].iloc[-1]:.4f})",
         f"- {'✅' if q_convergence else '❌'} <1% difference between final Q1/Q2 values ({100*q_diff/q_avg if q_avg != 0 else 'N/A'}%)",
@@ -620,7 +620,7 @@ def generate_readiness_report(df, output_dir):
         report.append("- Harmonize Q-networks or increase target network update frequency")
     
     # Write report to file
-    with open(Path(output_dir) / "model_readiness.md", 'w') as f:
+    with open(Path(output_dir) / "model_readiness.md", 'w', encoding='utf-8') as f:
         f.write('\n'.join(report))
 
 
