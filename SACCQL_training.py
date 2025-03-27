@@ -359,18 +359,28 @@ def analyze_training_log(log_path="training_logs/training_log.csv", output_dir="
     # Read log data
     df = pd.read_csv(log_path)
     
-    # Create subplots
-    fig, axs = plt.subplots(3, 3, figsize=(18, 12))
+    # Create dynamic subplot grid
+    metrics = [col for col in df.columns if col != 'epoch']
+    n_metrics = len(metrics)
+    n_cols = 3
+    n_rows = (n_metrics + n_cols - 1) // n_cols  # Ceiling division
+    
+    fig, axs = plt.subplots(n_rows, n_cols, figsize=(18, 4*n_rows))
     fig.suptitle('Training Metrics Analysis', fontsize=16)
     
-    # Plot each metric
-    metrics = [col for col in df.columns if col != 'epoch']
+    # Flatten axes array for easier iteration
+    axs = axs.flatten()
+    
     for idx, metric in enumerate(metrics):
-        ax = axs[idx//3, idx%3]
+        ax = axs[idx]
         ax.plot(df['epoch'], df[metric])
         ax.set_title(metric.replace('_', ' ').title())
         ax.set_xlabel('Epoch')
         ax.grid(True)
+    
+    # Hide empty subplots
+    for idx in range(n_metrics, len(axs)):
+        axs[idx].axis('off')
     
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig(Path(output_dir) / "training_metrics.png")
