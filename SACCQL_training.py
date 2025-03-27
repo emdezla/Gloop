@@ -34,14 +34,14 @@ class DiabetesDataset(Dataset):
             raise ValueError("Dataset contains NaN values after preprocessing")
         
         # Add data validation
-        assert df["action"].between(0, 5).all(), "Actions must be between 0-5 units"
+        assert df["action"].between(-1, 1).all(), "Actions must be between -1 and 1"
         assert df["glu"].between(40, 400).all(), "Invalid glucose values"
         
         # State features (8 dimensions)
         self.states = df[["glu", "glu_d", "glu_t", "hr", "hr_d", "hr_t", "iob", "hour"]].values.astype(np.float32)
         
-        # Single action dimension
-        self.actions = df["action"].values.astype(np.float32).reshape(-1, 1)  # Changed from 2 columns
+        # Single action dimension (already in [-1, 1] range)
+        self.actions = df["action"].values.astype(np.float32).reshape(-1, 1)  # No scaling needed
         
         # Rewards computed from next glucose values
         self.rewards = self._compute_rewards(df["glu_raw"].values)
@@ -117,7 +117,7 @@ class SACAgent(nn.Module):
         self.log_std = nn.Parameter(torch.zeros(1, action_dim))  # Start from neutral
         self.log_alpha = nn.Parameter(torch.tensor([0.0]))  # Start from 0.0 instead of 1.0
         self.target_entropy = -action_dim  # Should be -1 for 1D action
-        self.action_scale = nn.Parameter(torch.tensor([1.0]), requires_grad=False)  # Changed to Parameter
+        self.action_scale = 1.0  # Fixed, no longer a learnable parameter
         
         # Initialize weights properly
         for layer in self.actor:
@@ -186,15 +186,15 @@ class SACAgent(nn.Module):
         return mean, log_std
 
     def act(self, state, deterministic=False):
-        """Proper action scaling"""
+        """Direct tanh output without scaling"""
         mean, log_std = self.forward(state)
         std = log_std.exp()
         dist = torch.distributions.Normal(mean, std)
         
         if deterministic:
-            action = torch.tanh(mean) * self.action_scale
+            action = torch.tanh(mean)  # Removed scaling
         else:
-            action = torch.tanh(dist.rsample()) * self.action_scale
+            action = torch.tanh(dist.rsample())  # Removed scaling
             
         return action
 
@@ -306,6 +306,11 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', log_
                     print(f"State stats: mean={states.mean().item():.2f} ±{states.std().item():.2f}")
                     print(f"Action stats: mean={actions.mean().item():.2f} ±{actions.std().item():.2f}")
                     
+                    # Add Q-network input dimension check
+                    state_action = torch.cat([states, actions], 1)
+                    assert state_action.shape[1] == 8 + 1, \
+                        f"Invalid Q-network input shape: {state_action.shape}, expected 9 features"
+                    
                     # Verify tensor ranges
                     print(f"State range: {states.min().item():.1f} to {states.max().item():.1f}")
                     print(f"Action range: {actions.min().item():.1f} to {actions.max().item():.1f}")
@@ -316,10 +321,10 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', log_
                         print(states)
                         raise ValueError("NaN/Inf in states")
 
-                    if torch.any(actions < 0) or torch.any(actions > 5):
+                    if torch.any(actions < -1) or torch.any(actions > 1):
                         print("Invalid actions detected:")
                         print(actions)
-                        raise ValueError("Actions outside [0,5] range")
+                        raise ValueError("Actions outside [-1,1] range")
                     
                     # Add NaN checks
                     if torch.isnan(states).any() or torch.isnan(actions).any():
@@ -385,7 +390,7 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', log_
                     mean, log_std = agent.forward(states)
                     std = log_std.exp()
                     dist = torch.distributions.Normal(mean, std)
-                    action_samples = torch.tanh(dist.rsample()) * agent.action_scale  # Add action scaling
+                    action_samples = torch.tanh(dist.rsample())  # Removed action scaling
                     
                     # Proper Gaussian entropy calculation
                     entropy = 0.5 * (1.0 + torch.log(2 * torch.tensor(np.pi).to(device)) + log_std).mean()
