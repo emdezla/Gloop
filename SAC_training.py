@@ -2,242 +2,154 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-from collections import deque
-import random
 import os
 from tqdm import tqdm
-from helpers import DiabetesDataset, debug_tensor, compute_reward_torch
+from helpers import DiabetesDataset, debug_tensor, Mish
 from torch.utils.data import DataLoader
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-class ReplayBuffer:
-    def __init__(self, capacity):
-        self.buffer = deque(maxlen=capacity)
-        
-    def push(self, state, action, reward, next_state, done):
-        self.buffer.append((state, action, reward, next_state, done))
-        
-    def sample(self, batch_size):
-        state, action, reward, next_state, done = zip(*random.sample(self.buffer, batch_size))
-        return (
-            torch.FloatTensor(np.array(state)).to(device),
-            torch.FloatTensor(np.array(action)).to(device),
-            torch.FloatTensor(np.array(reward)).unsqueeze(-1).to(device),
-            torch.FloatTensor(np.array(next_state)).to(device),
-            torch.FloatTensor(np.array(done)).unsqueeze(-1).to(device)
-        )
-    
-    def __len__(self):
-        return len(self.buffer)
-
-class LSTMActor(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_size=16, action_scale=1.0):
+class SACAgent(nn.Module):
+    def __init__(self, state_dim=8, action_dim=2, hidden_dim=256):
         super().__init__()
-        self.action_scale = action_scale
-        self.lstm = nn.LSTM(state_dim, hidden_size, batch_first=True)
-        self.net = nn.Sequential(
-            nn.Linear(hidden_size, 32), nn.ReLU(),
-            nn.Linear(32, 32), nn.ReLU(),
-            nn.Linear(32, 32), nn.ReLU()
-        )
-        self.mean = nn.Linear(32, action_dim)
-        self.log_std = nn.Linear(32, action_dim)
-        
-        # Initialize with small weights
-        nn.init.xavier_uniform_(self.mean.weight, gain=0.01)
-        nn.init.constant_(self.log_std.weight, -1.0)
-        
-    def forward(self, state):
-        # state shape: [batch_size, seq_len, state_dim]
-        lstm_out, _ = self.lstm(state)
-        features = self.net(lstm_out[:, -1, :])  # Use last timestep
-        mean = self.mean(features)
-        log_std = torch.clamp(self.log_std(features), -5, 2)  # Constrain log_std
-        return mean, log_std
-        
-    def sample(self, state, deterministic=False):
-        mean, log_std = self.forward(state)
-        
-        if deterministic:
-            action = torch.tanh(mean) * self.action_scale
-            return action, None
-            
-        std = log_std.exp()
-        normal = torch.distributions.Normal(mean, std)
-        x_t = normal.rsample()  # Reparameterization trick
-        
-        # Squash and scale action
-        y_t = torch.tanh(x_t)
-        action = y_t * self.action_scale
-        
-        # Calculate log probability with correction for tanh squashing
-        log_prob = normal.log_prob(x_t)
-        log_prob -= torch.log(1 - y_t.pow(2) + 1e-6)
-        log_prob = log_prob.sum(-1, keepdim=True)
-        
-        return action, log_prob
-
-class LSTMCritic(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_size=16):
-        super().__init__()
-        self.lstm = nn.LSTM(state_dim, hidden_size, batch_first=True)
-        self.net = nn.Sequential(
-            nn.Linear(hidden_size + action_dim, 32), nn.ReLU(),
-            nn.Linear(32, 32), nn.ReLU(),
-            nn.Linear(32, 32), nn.ReLU(),
-            nn.Linear(32, 1)
-        )
-        
-    def forward(self, state, action):
-        # state shape: [batch_size, seq_len, state_dim]
-        lstm_out, _ = self.lstm(state)
-        state_feat = lstm_out[:, -1, :]  # Use last timestep
-        x = torch.cat([state_feat, action], dim=1)
-        return self.net(x)
-
-class SACAgent:
-    def __init__(self, state_dim, action_dim, hidden_size=16, action_scale=1.0):
-        self.gamma = 0.997  # Match the gamma in the existing SAC implementation
-        self.tau = 0.005    # Soft update parameter
-        self.batch_size = 256
-        self.action_scale = action_scale
         self.state_dim = state_dim
         self.action_dim = action_dim
+        self.gamma = 0.99
         
-        # Networks
-        self.actor = LSTMActor(state_dim, action_dim, hidden_size, action_scale).to(device)
-        self.critic1 = LSTMCritic(state_dim, action_dim, hidden_size).to(device)
-        self.critic2 = LSTMCritic(state_dim, action_dim, hidden_size).to(device)
-        self.target_critic1 = LSTMCritic(state_dim, action_dim, hidden_size).to(device)
-        self.target_critic2 = LSTMCritic(state_dim, action_dim, hidden_size).to(device)
+        # Actor network (policy)
+        self.actor = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim), Mish(),
+            nn.Linear(hidden_dim, hidden_dim), Mish(),
+            nn.Linear(hidden_dim, action_dim), nn.Tanh()
+        )
         
-        # Initialize targets
-        self.target_critic1.load_state_dict(self.critic1.state_dict())
-        self.target_critic2.load_state_dict(self.critic2.state_dict())
+        # Twin Q-networks
+        self.q1 = nn.Sequential(
+            nn.Linear(state_dim + action_dim, hidden_dim), Mish(),
+            nn.Linear(hidden_dim, hidden_dim), Mish(),
+            nn.Linear(hidden_dim, 1)
+        )
+        
+        self.q2 = nn.Sequential(
+            nn.Linear(state_dim + action_dim, hidden_dim), Mish(),
+            nn.Linear(hidden_dim, hidden_dim), Mish(),
+            nn.Linear(hidden_dim, 1)
+        )
+        
+        # Target networks
+        self.q1_target = nn.Sequential(
+            nn.Linear(state_dim + action_dim, hidden_dim), Mish(),
+            nn.Linear(hidden_dim, hidden_dim), Mish(),
+            nn.Linear(hidden_dim, 1)
+        )
+        
+        self.q2_target = nn.Sequential(
+            nn.Linear(state_dim + action_dim, hidden_dim), Mish(),
+            nn.Linear(hidden_dim, hidden_dim), Mish(),
+            nn.Linear(hidden_dim, 1)
+        )
+        
+        # Copy parameters to target networks
+        self.q1_target.load_state_dict(self.q1.state_dict())
+        self.q2_target.load_state_dict(self.q2.state_dict())
         
         # Optimizers
-        self.actor_optim = optim.Adam(self.actor.parameters(), lr=3e-4)
-        self.critic_optim = optim.Adam(
-            list(self.critic1.parameters()) + list(self.critic2.parameters()), 
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=3e-4)
+        self.critic_optimizer = optim.Adam(
+            list(self.q1.parameters()) + list(self.q2.parameters()), 
             lr=3e-4
         )
         
-        # Entropy tuning
-        self.target_entropy = -torch.prod(torch.Tensor([action_dim])).item()  # -dim(A)
-        self.log_alpha = torch.zeros(1, requires_grad=True, device=device)
-        self.alpha = torch.exp(self.log_alpha)
-        self.alpha_optim = optim.Adam([self.log_alpha], lr=3e-4)
-        
-        self.replay_buffer = ReplayBuffer(100000)
+        # Move to device
+        self.to(device)
         
     def act(self, state, deterministic=False):
-        """Get action for a single state"""
+        """Get action for a state"""
         with torch.no_grad():
-            # Reshape state to [1, 1, state_dim] for single timestep
-            if len(state.shape) == 1:
-                state = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0).to(device)
-            elif len(state.shape) == 2:
-                state = torch.FloatTensor(state).unsqueeze(0).to(device)
-            else:
+            if not isinstance(state, torch.Tensor):
                 state = torch.FloatTensor(state).to(device)
-                
-            action, _ = self.actor.sample(state, deterministic)
-        return action.cpu().numpy().squeeze()
+            if len(state.shape) == 1:
+                state = state.unsqueeze(0)
+            action = self.actor(state)
+        return action.cpu().numpy()
         
-    def update(self):
-        """Perform one update step on the agent"""
-        if len(self.replay_buffer) < self.batch_size:
-            return {
-                'critic_loss': 0,
-                'actor_loss': 0,
-                'alpha_loss': 0,
-                'alpha': self.alpha.item()
-            }
-            
-        # Sample batch
-        states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
+    def update(self, batch):
+        """Perform one update step using a batch of data"""
+        # Unpack batch
+        states = batch["state"].to(device)
+        actions = batch["action"].to(device)
+        rewards = batch["reward"].to(device).unsqueeze(1)
+        next_states = batch["next_state"].to(device)
+        dones = batch["done"].to(device).unsqueeze(1)
         
         # Update critics
         with torch.no_grad():
-            next_actions, next_log_probs = self.actor.sample(next_states)
-            q1_next = self.target_critic1(next_states, next_actions)
-            q2_next = self.target_critic2(next_states, next_actions)
-            q_next = torch.min(q1_next, q2_next) - self.alpha * next_log_probs
+            next_actions = self.actor(next_states)
+            q1_next = self.q1_target(torch.cat([next_states, next_actions], 1))
+            q2_next = self.q2_target(torch.cat([next_states, next_actions], 1))
+            q_next = torch.min(q1_next, q2_next)
             target_q = rewards + (1 - dones) * self.gamma * q_next
             
-        q1 = self.critic1(states, actions)
-        q2 = self.critic2(states, actions)
+        current_q1 = self.q1(torch.cat([states, actions], 1))
+        current_q2 = self.q2(torch.cat([states, actions], 1))
         
-        critic_loss = nn.MSELoss()(q1, target_q) + nn.MSELoss()(q2, target_q)
+        critic_loss = nn.MSELoss()(current_q1, target_q) + nn.MSELoss()(current_q2, target_q)
         
-        self.critic_optim.zero_grad()
+        self.critic_optimizer.zero_grad()
         critic_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.critic1.parameters(), 1.0)
-        torch.nn.utils.clip_grad_norm_(self.critic2.parameters(), 1.0)
-        self.critic_optim.step()
+        torch.nn.utils.clip_grad_norm_(list(self.q1.parameters()) + list(self.q2.parameters()), 1.0)
+        self.critic_optimizer.step()
         
         # Update actor
-        new_actions, log_probs = self.actor.sample(states)
-        q1_new = self.critic1(states, new_actions)
-        q2_new = self.critic2(states, new_actions)
-        q_new = torch.min(q1_new, q2_new)
+        policy_actions = self.actor(states)
+        q1_policy = self.q1(torch.cat([states, policy_actions], 1))
         
-        actor_loss = (self.alpha * log_probs - q_new).mean()
+        actor_loss = -q1_policy.mean()
         
-        self.actor_optim.zero_grad()
+        self.actor_optimizer.zero_grad()
         actor_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
-        self.actor_optim.step()
-        
-        # Update alpha (temperature parameter)
-        alpha_loss = -(self.log_alpha * (log_probs.detach() + self.target_entropy)).mean()
-        
-        self.alpha_optim.zero_grad()
-        alpha_loss.backward()
-        self.alpha_optim.step()
-        self.alpha = torch.exp(self.log_alpha)
+        self.actor_optimizer.step()
         
         # Soft update target networks
-        for target_param, param in zip(self.target_critic1.parameters(), self.critic1.parameters()):
-            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
-            
-        for target_param, param in zip(self.target_critic2.parameters(), self.critic2.parameters()):
-            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
-            
+        self._soft_update_targets()
+        
         return {
             'critic_loss': critic_loss.item(),
             'actor_loss': actor_loss.item(),
-            'alpha_loss': alpha_loss.item(),
-            'alpha': self.alpha.item()
+            'q_value': q1_policy.mean().item()
         }
+    
+    def _soft_update_targets(self, tau=0.005):
+        """Soft update target networks"""
+        for target_param, param in zip(self.q1_target.parameters(), self.q1.parameters()):
+            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+            
+        for target_param, param in zip(self.q2_target.parameters(), self.q2.parameters()):
+            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
     
     def save(self, path):
         """Save model to disk"""
-        if path:  # Only save if path is provided
-            # Ensure directory exists before saving
+        if path:
             save_dir = os.path.dirname(path)
-            if save_dir:  # Only create directories if path contains a directory
+            if save_dir:
                 os.makedirs(save_dir, exist_ok=True)
             torch.save({
                 'actor': self.actor.state_dict(),
-                'critic1': self.critic1.state_dict(),
-                'critic2': self.critic2.state_dict(),
-                'target_critic1': self.target_critic1.state_dict(),
-                'target_critic2': self.target_critic2.state_dict(),
-                'log_alpha': self.log_alpha,
+                'q1': self.q1.state_dict(),
+                'q2': self.q2.state_dict(),
+                'q1_target': self.q1_target.state_dict(),
+                'q2_target': self.q2_target.state_dict(),
             }, path)
         
     def load(self, path):
         """Load model from disk"""
         checkpoint = torch.load(path)
         self.actor.load_state_dict(checkpoint['actor'])
-        self.critic1.load_state_dict(checkpoint['critic1'])
-        self.critic2.load_state_dict(checkpoint['critic2'])
-        self.target_critic1.load_state_dict(checkpoint['target_critic1'])
-        self.target_critic2.load_state_dict(checkpoint['target_critic2'])
-        self.log_alpha = checkpoint['log_alpha']
-        self.alpha = torch.exp(self.log_alpha)
+        self.q1.load_state_dict(checkpoint['q1'])
+        self.q2.load_state_dict(checkpoint['q2'])
+        self.q1_target.load_state_dict(checkpoint['q1_target'])
+        self.q2_target.load_state_dict(checkpoint['q2_target'])
 
 def train_sac_offline(dataset_path, epochs=1000, batch_size=256, save_path=None):
     """Train SAC agent using offline data from a dataset"""
@@ -246,54 +158,43 @@ def train_sac_offline(dataset_path, epochs=1000, batch_size=256, save_path=None)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     
     # Create agent
-    state_dim = 8  # From the dataset
-    action_dim = 2  # basal, bolus
-    agent = SACAgent(state_dim, action_dim, hidden_size=16, action_scale=1.0)
-    
-    # Fill replay buffer with dataset
-    print("Filling replay buffer with dataset...")
-    for batch in tqdm(dataloader):
-        states = batch["state"].numpy()
-        actions = batch["action"].numpy()
-        rewards = batch["reward"].numpy()
-        next_states = batch["next_state"].numpy()
-        dones = batch["done"].numpy()
-        
-        for i in range(len(states)):
-            # Reshape state to sequence format [seq_len, state_dim]
-            state_seq = np.expand_dims(states[i], axis=0)
-            next_state_seq = np.expand_dims(next_states[i], axis=0)
-            
-            agent.replay_buffer.push(
-                state_seq,
-                actions[i],
-                rewards[i],
-                next_state_seq,
-                dones[i]
-            )
+    agent = SACAgent(state_dim=8, action_dim=2, hidden_dim=256)
     
     # Training loop
     print(f"Training SAC agent for {epochs} epochs...")
     metrics = {
         'critic_loss': [],
         'actor_loss': [],
-        'alpha_loss': [],
-        'alpha': []
+        'q_value': []
     }
     
     for epoch in tqdm(range(epochs)):
-        update_info = agent.update()
+        epoch_metrics = {
+            'critic_loss': 0,
+            'actor_loss': 0,
+            'q_value': 0
+        }
+        batch_count = 0
         
-        # Record metrics
-        for k, v in update_info.items():
-            metrics[k].append(v)
+        for batch in dataloader:
+            update_info = agent.update(batch)
+            
+            # Record metrics
+            for k, v in update_info.items():
+                epoch_metrics[k] += v
+            batch_count += 1
+        
+        # Average metrics for this epoch
+        for k in epoch_metrics:
+            avg_value = epoch_metrics[k] / batch_count
+            metrics[k].append(avg_value)
         
         # Print progress
         if (epoch + 1) % 100 == 0:
             print(f"Epoch {epoch+1}/{epochs}")
-            print(f"  Critic Loss: {np.mean(metrics['critic_loss'][-100:]):.4f}")
-            print(f"  Actor Loss: {np.mean(metrics['actor_loss'][-100:]):.4f}")
-            print(f"  Alpha: {metrics['alpha'][-1]:.4f}")
+            print(f"  Critic Loss: {metrics['critic_loss'][-1]:.4f}")
+            print(f"  Actor Loss: {metrics['actor_loss'][-1]:.4f}")
+            print(f"  Q Value: {metrics['q_value'][-1]:.4f}")
             
             # Save checkpoint
             if save_path and (epoch + 1) % 100 == 0:
@@ -329,6 +230,7 @@ def evaluate_agent(agent, dataset_path, num_episodes=10):
         episode_indices.append(current_episode)
     
     # Select random episodes to evaluate
+    import random
     selected_episodes = random.sample(episode_indices, min(num_episodes, len(episode_indices)))
     
     for episode in selected_episodes:
@@ -339,8 +241,7 @@ def evaluate_agent(agent, dataset_path, num_episodes=10):
             state = sample['state'].numpy()
             
             # Get action from agent
-            state_seq = np.expand_dims(state, axis=0)  # [1, state_dim]
-            action = agent.act(state_seq, deterministic=True)
+            action = agent.act(state, deterministic=True)
             
             # Use reward from dataset
             reward = sample['reward'].item()

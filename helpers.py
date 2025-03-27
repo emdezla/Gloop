@@ -6,12 +6,8 @@ import torch.nn as nn
 import torch.optim as optim
 import os
 import csv
-import pandas as pd
-from datetime import datetime
 import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
-from tqdm import tqdm  # For progress bar
-from collections import defaultdict
+from tqdm import tqdm
 
 # Custom activation function for better gradient flow
 class Mish(nn.Module):
@@ -48,7 +44,7 @@ class DiabetesDataset(Dataset):
 
         # Compute rewards based on glu_raw at t+1
         glucose_next_tensor = torch.tensor(self.df["glu_raw"].values, dtype=torch.float32)
-        self.rewards = compute_reward_torch(glucose_next_tensor) / 5.0  # Reduced normalization factor
+        self.rewards = self._compute_rewards(glucose_next_tensor)
 
         # Compute next_states using vectorized roll
         self.next_states = np.roll(self.states, shift=-1, axis=0)
@@ -69,6 +65,17 @@ class DiabetesDataset(Dataset):
         assert all(len(arr) == L for arr in [self.actions, self.rewards, self.next_states, self.dones]), \
             f"Inconsistent lengths in dataset components: {L}"
 
+    def _compute_rewards(self, glucose_next):
+        """Simple risk-based reward calculation"""
+        glucose_next = torch.clamp(glucose_next, min=1e-6)
+        log_term = torch.log(glucose_next) ** 1.084
+        f = 1.509 * (log_term - 5.381)
+        ri = 10 * f ** 2
+
+        reward = -torch.clamp(ri / 100.0, 0, 1)
+        reward[glucose_next <= 39.0] = -15.0
+        return reward / 5.0  # Reduced normalization factor
+
     def __len__(self):
         return len(self.states)
 
@@ -80,19 +87,6 @@ class DiabetesDataset(Dataset):
             "next_state": torch.from_numpy(self.next_states[idx]).float(),
             "done":       self.dones[idx]
         }
-
-def compute_reward_torch(glucose_next):
-    """
-    Compute RI-based reward in PyTorch.
-    """
-    glucose_next = torch.clamp(glucose_next, min=1e-6)
-    log_term = torch.log(glucose_next) ** 1.084
-    f = 1.509 * (log_term - 5.381)
-    ri = 10 * f ** 2
-
-    reward = -torch.clamp(ri / 100.0, 0, 1)
-    reward[glucose_next <= 39.0] = -15.0
-    return reward
 
 def debug_tensor(tensor, name="", check_grad=False, threshold=1e6):
     """
@@ -129,8 +123,6 @@ def debug_tensor(tensor, name="", check_grad=False, threshold=1e6):
             print(f"❌ NaNs in gradient of {name}")
         if torch.isinf(grad).any():
             print(f"❌ Infs in gradient of {name}")
-
-# Keep the original SACCQL class and train_offline function for comparison
 class SACCQL(nn.Module):
     def __init__(self): 
         super().__init__()
