@@ -128,14 +128,14 @@ class SACAgent(nn.Module):
         self.q1_target.load_state_dict(self.q1.state_dict())
         self.q2_target.load_state_dict(self.q2.state_dict())
         
-        # Different learning rates for different components
+        # Different learning rates for different components with reduced critic LR
         self.optimizer = optim.AdamW([
             {'params': self.actor.parameters(), 'lr': 1e-5},  # Lower actor LR
             {'params': self.mean.parameters(), 'lr': 1e-5},
             {'params': self.log_std, 'lr': 1e-5},
-            {'params': self.log_alpha, 'lr': 1e-4},  # Faster alpha updates
-            {'params': self.q1.parameters(), 'lr': 3e-4},  # Faster critics
-            {'params': self.q2.parameters(), 'lr': 3e-4}
+            {'params': self.log_alpha, 'lr': 1e-5},  # Reduced from 1e-4
+            {'params': self.q1.parameters(), 'lr': 1e-4},  # Reduced from 3e-4
+            {'params': self.q2.parameters(), 'lr': 1e-4}   # Reduced from 3e-4
         ], weight_decay=1e-4)
         
         # Learning rate scheduler
@@ -143,17 +143,23 @@ class SACAgent(nn.Module):
             self.optimizer, 'min', patience=5, factor=0.5)
 
     def _create_q_network(self, state_dim, action_dim):
-        """Create Q-network with simpler architecture"""
-        print(f"Creating Q-network with state_dim:{state_dim} action_dim:{action_dim}")  # Debug
+        """Create more stable Q-network with gradient protections"""
+        print(f"Creating Q-network with state_dim:{state_dim} action_dim:{action_dim}")
         net = nn.Sequential(
             nn.Linear(state_dim + action_dim, 128),
-            nn.ReLU(),
+            nn.LayerNorm(128),  # Add layer normalization
+            nn.LeakyReLU(0.01),  # Safer than ReLU
+            nn.Linear(128, 128),
+            nn.LayerNorm(128),
+            nn.LeakyReLU(0.01),
             nn.Linear(128, 1)
         )
-        # Initialize final layer weights
-        nn.init.uniform_(net[-1].weight, -3e-3, 3e-3)
-        nn.init.constant_(net[-1].bias, 0)
-        print(f"Q-network structure: {net}")  # Debug
+        # Better weight initialization
+        for layer in net:
+            if isinstance(layer, nn.Linear):
+                nn.init.kaiming_normal_(layer.weight, mode='fan_in', nonlinearity='leaky_relu')
+                nn.init.constant_(layer.bias, 0)
+        print(f"Q-network structure: {net}")
         return net
 
     def forward(self, state):
@@ -286,6 +292,10 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', log_
                     print(f"State shape: {states.shape}")  # Should be [batch,8]
                     print(f"Action shape: {actions.shape}")  # Should be [batch,1]
                     
+                    # Add input value checks
+                    print(f"State stats: mean={states.mean().item():.2f} ±{states.std().item():.2f}")
+                    print(f"Action stats: mean={actions.mean().item():.2f} ±{actions.std().item():.2f}")
+                    
                     # Add NaN checks
                     if torch.isnan(states).any() or torch.isnan(actions).any():
                         print("NaN detected in input data!")
@@ -317,15 +327,21 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', log_
                         next_actions = agent.act(next_states)
                         q1_next = agent.q1_target(torch.cat([next_states, next_actions], 1))
                         q2_next = agent.q2_target(torch.cat([next_states, next_actions], 1))
-                        # Change from hard clipping to relative clipping
                         q_next = torch.min(q1_next, q2_next)
                         target_q = rewards + 0.99 * (1 - dones) * q_next
-                        target_q = torch.clamp(target_q, -5.0, current_q1.detach().mean() + 5.0)  # Dynamic range
+                        target_q = torch.clamp(target_q, -10.0, 10.0)  # Absolute bounds
                     
-                    # MSE loss for critic (pure SAC)
-                    q1_loss = F.mse_loss(current_q1, target_q)
-                    q2_loss = F.mse_loss(current_q2, target_q)
+                    # Add target value checks
+                    print(f"Target Q stats: min={target_q.min().item():.2f}, max={target_q.max().item():.2f}")
+                    
+                    # Huber loss for critic (more robust than MSE)
+                    q1_loss = F.huber_loss(current_q1, target_q, delta=2.0)
+                    q2_loss = F.huber_loss(current_q2, target_q, delta=2.0)
                     critic_loss = q1_loss + q2_loss
+                    
+                    # Add gradient scaling for critic
+                    scale_gradients = lambda x: x * 0.5  # Scale gradients before clipping
+                    critic_loss = critic_loss * scale_gradients(critic_loss.detach())
                     
                     # Actor update
                     mean, log_std = agent.forward(states)
@@ -351,6 +367,14 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', log_
                     alpha_loss = -(agent.log_alpha * (entropy - agent.target_entropy).detach()).mean()
                     print(f"Alpha loss: {alpha_loss.item():.4f}")
                     
+                    # Helper function to check gradients
+                    def check_grads(parameters):
+                        for p in parameters:
+                            if p.grad is not None and torch.isnan(p.grad).any():
+                                print(f"NaN gradients in {[n for n, param in agent.named_parameters() if param is p]}")
+                                return True
+                        return False
+                    
                     # Separate updates for better stability
                     # 1. Critic update
                     agent.optimizer.zero_grad()
@@ -367,16 +391,11 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', log_
                     )
                     
                     # Check for NaN in critic gradients
-                    has_nan_grad = False
-                    for param in list(agent.q1.parameters()) + list(agent.q2.parameters()):
-                        if param.grad is not None and torch.isnan(param.grad).any():
-                            has_nan_grad = True
-                            break
-                    
-                    if has_nan_grad:
-                        print("NaN detected in critic gradients, skipping critic update")
-                    else:
+                    if not check_grads(list(agent.q1.parameters()) + list(agent.q2.parameters())):
                         agent.optimizer.step()
+                    else:
+                        print("Skipping critic update due to NaN gradients")
+                        agent.optimizer.zero_grad()
                     
                     # 2. Actor update
                     agent.optimizer.zero_grad()
@@ -392,17 +411,12 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', log_
                         1.0
                     )
                     
-                    # Check for NaN in actor gradients
-                    has_nan_grad = False
-                    for param in list(agent.actor.parameters()) + [agent.log_std]:
-                        if param.grad is not None and torch.isnan(param.grad).any():
-                            has_nan_grad = True
-                            break
-                    
-                    if has_nan_grad:
-                        print("NaN detected in actor gradients, skipping actor update")
-                    else:
+                    # Check for NaN in actor gradients using the helper function
+                    if not check_grads(list(agent.actor.parameters()) + [agent.log_std]):
                         agent.optimizer.step()
+                    else:
+                        print("Skipping actor update due to NaN gradients")
+                        agent.optimizer.zero_grad()
                     
                     # 3. Alpha update
                     agent.optimizer.zero_grad()
@@ -411,11 +425,12 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', log_
                     # Gradient clipping for alpha
                     alpha_grad_norm = torch.nn.utils.clip_grad_norm_([agent.log_alpha], 1.0)
                     
-                    # Check for NaN in alpha gradient
-                    if agent.log_alpha.grad is not None and torch.isnan(agent.log_alpha.grad).any():
-                        print("NaN detected in alpha gradient, skipping alpha update")
-                    else:
+                    # Check for NaN in alpha gradient using the helper function
+                    if not check_grads([agent.log_alpha]):
                         agent.optimizer.step()
+                    else:
+                        print("Skipping alpha update due to NaN gradients")
+                        agent.optimizer.zero_grad()
                     
                     # Total gradient norm for logging
                     grad_norm = critic_grad_norm + actor_grad_norm + alpha_grad_norm
