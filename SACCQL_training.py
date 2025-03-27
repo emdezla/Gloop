@@ -260,12 +260,22 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models'):
     
     with open(log_path, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['epoch', 'critic_loss', 'actor_loss', 'alpha_loss'])
+        writer.writerow([
+            'epoch', 'critic_loss', 'actor_loss', 'alpha_loss',
+            'q1_value', 'q2_value', 'action_mean', 'action_std',
+            'entropy', 'grad_norm'
+        ])
     
     with tqdm(range(epochs), desc="Training") as pbar:
         for epoch in pbar:
             epoch_critic_loss = 0.0
             epoch_actor_loss = 0.0
+            epoch_q1_value = 0.0
+            epoch_q2_value = 0.0
+            epoch_action_mean = 0.0
+            epoch_action_std = 0.0
+            epoch_entropy = 0.0
+            epoch_grad_norm = 0.0
             
             for batch in dataloader:
                 # Prepare batch
@@ -292,6 +302,12 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models'):
                 q2_loss = F.mse_loss(current_q2, target_q)
                 critic_loss = q1_loss + q2_loss
                 
+                # Capture Q-values
+                current_q1_mean = current_q1.mean().item()
+                current_q2_mean = current_q2.mean().item()
+                epoch_q1_value += current_q1_mean
+                epoch_q2_value += current_q2_mean
+                
                 agent.critic_optim.zero_grad()
                 critic_loss.backward()
                 torch.nn.utils.clip_grad_norm_(
@@ -311,9 +327,23 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models'):
                 # Actor loss with entropy term
                 actor_loss = -(torch.min(q1_pred, q2_pred)).mean()
                 
+                # Capture action statistics
+                with torch.no_grad():
+                    action_mean = pred_actions.mean().item()
+                    action_std = pred_actions.std().item()
+                epoch_action_mean += action_mean
+                epoch_action_std += action_std
+                
+                # Capture entropy
+                current_alpha = agent.log_alpha.exp().item()
+                epoch_entropy += current_alpha
+                
                 agent.actor_optim.zero_grad()
                 actor_loss.backward()
-                torch.nn.utils.clip_grad_norm_(agent.actor.parameters(), 1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    agent.actor.parameters(), 1.0
+                ).item()
+                epoch_grad_norm += grad_norm
                 agent.actor_optim.step()
                 
                 # Alpha (temperature) update
@@ -335,18 +365,38 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models'):
             num_batches = len(dataloader)
             epoch_critic_loss /= num_batches
             epoch_actor_loss /= num_batches
+            epoch_q1_value /= num_batches
+            epoch_q2_value /= num_batches
+            epoch_action_mean /= num_batches
+            epoch_action_std /= num_batches
+            epoch_entropy /= num_batches
+            epoch_grad_norm /= num_batches
             
             # Update progress bar
             pbar.set_postfix({
-                'Critic Loss': f"{epoch_critic_loss:.3f}",
-                'Actor Loss': f"{epoch_actor_loss:.3f}",
-                'Alpha': f"{agent.log_alpha.exp().item():.3f}"
+                'Critic': f"{epoch_critic_loss:.3f}",
+                'Actor': f"{epoch_actor_loss:.3f}",
+                'Q1': f"{epoch_q1_value:.3f}",
+                'Q2': f"{epoch_q2_value:.3f}",
+                'α': f"{epoch_entropy:.3f}",
+                '∇': f"{epoch_grad_norm:.2f}"
             })
             
             # Log metrics after each epoch
             with open(log_path, 'a', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow([epoch, epoch_critic_loss, epoch_actor_loss, epoch_alpha_loss])
+                writer.writerow([
+                    epoch, 
+                    epoch_critic_loss, 
+                    epoch_actor_loss, 
+                    epoch_alpha_loss,
+                    epoch_q1_value,
+                    epoch_q2_value,
+                    epoch_action_mean,
+                    epoch_action_std,
+                    epoch_entropy,
+                    epoch_grad_norm
+                ])
             
             # Save checkpoint every 50 epochs
             if (epoch+1) % 50 == 0:
