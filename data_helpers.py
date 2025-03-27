@@ -144,7 +144,7 @@ def choose_value(row, meas_col):
         else:
             return np.nan
 
-def compute_iob(df, DOA_hours=5, interval_min=5):
+def compute_iob(df, DOA_hours=3, interval_min=5):
     """
     Compute the Insulin On Board (IOB) for each row of the DataFrame.
     
@@ -179,3 +179,69 @@ def compute_iob(df, DOA_hours=5, interval_min=5):
     df_out['IOB'] = bolus_contrib + basal_contrib
     
     return df_out
+
+def compute_tia(df, DOA_hours=3, interval_min=5):
+    """
+    Compute the Total Insulin Action (TIA) for each row of the DataFrame.
+    
+    Parameters:
+        df (pd.DataFrame): DataFrame with columns 'real_basal' (in U/hr) and 'bolus' (in U).
+        DOA_hours (float): Duration of insulin action in hours (how long a bolus affects TIA).
+        interval_min (float): Time difference between consecutive rows in minutes.
+    
+    Returns:
+        pd.DataFrame: A new DataFrame with added 'TIA' column (U/hr).
+    """
+    # Convert time step to hours
+    interval_hr = interval_min / 60.0
+    
+    # Number of steps for insulin decay
+    decay_steps = int(DOA_hours / interval_hr)
+    
+    # Define decay curve (quadratic) and normalize to sum=1
+    t = np.linspace(0, 1, decay_steps)
+    decay = 1 - (t**2) * (3 - 2*t)  # Quadratic decay from 1 to 0
+    decay /= decay.sum()  # Normalize so total decayed bolus = original amount
+    
+    # Compute bolus contributions over time using convolution
+    bolus_contrib = np.convolve(df['bolus'], decay, mode='full')[:len(df)]
+    
+    # Convert bolus contribution to U/hr (since interval is in minutes)
+    bolus_contrib_hr = bolus_contrib / (interval_min / 60)
+    
+    # Total Insulin Action = Basal (U/hr) + Bolus Contribution (U/hr)
+    df_out = df.copy()
+    df_out['TIA'] = df['real_basal'] + bolus_contrib_hr
+    
+    return df_out
+
+def tia_action(df, tia_col='TIA', action_col='action', eta=4.0, I_max=5.0):
+    """
+    Convert Total Insulin Action (TIA) column to action values `a` ∈ [-1, 1] in a DataFrame.
+    
+    Parameters:
+        df (pd.DataFrame): Input DataFrame containing TIA values
+        tia_col (str): Name of column containing Total Insulin Action (U/hr)
+        action_col (str): Name of output column to store actions
+        eta (float): Scaling parameter (default=4.0)
+        I_max (float): Maximum insulin rate in U/min (default=5.0)
+        
+    Returns:
+        pd.DataFrame: DataFrame with added action column
+    
+    Example:
+        df = tia_action(df, tia_col='TIA', action_col='a')
+    """
+    # Convert TIA (U/hr) to insulin pump rate (U/min)
+    I_pump = df[tia_col] / 60  # Convert U/hr to U/min
+    
+    # Clip to valid range [0, I_max] to avoid numerical issues
+    I_pump = np.clip(I_pump, 1e-9, I_max)  # Small positive value to avoid log(0)
+    
+    # Compute action using the pump equation
+    df[action_col] = 1 + (1/eta) * np.log(I_pump/I_max)
+    
+    # Clip final actions to [-1, 1] range
+    df[action_col] = np.clip(df[action_col], -1, 1)
+    
+    return df
