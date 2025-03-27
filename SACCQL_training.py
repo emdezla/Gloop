@@ -33,6 +33,10 @@ class DiabetesDataset(Dataset):
         if df[["glu", "glu_d", "glu_t", "hr", "hr_d", "hr_t", "iob", "hour"]].isna().any().any():
             raise ValueError("Dataset contains NaN values after preprocessing")
         
+        # Add data validation
+        assert df["action"].between(0, 5).all(), "Actions must be between 0-5 units"
+        assert df["glu"].between(40, 400).all(), "Invalid glucose values"
+        
         # State features (8 dimensions)
         self.states = df[["glu", "glu_d", "glu_t", "hr", "hr_d", "hr_t", "iob", "hour"]].values.astype(np.float32)
         
@@ -60,6 +64,12 @@ class DiabetesDataset(Dataset):
         rewards = -risk_index / (risk_index + 50)  # Range [-1, 0]
         rewards = np.clip(rewards, -5.0, 0.0)  # Hard clip
         rewards[glucose_next < 54] = -5.0  # Stronger hypo penalty
+        
+        # Add reward validation
+        if np.isnan(rewards).any():
+            nan_indices = np.where(np.isnan(rewards))[0]
+            raise ValueError(f"NaN rewards at indices: {nan_indices}")
+            
         return rewards.astype(np.float32)
 
     def _sanitize_transitions(self):
@@ -154,10 +164,10 @@ class SACAgent(nn.Module):
             nn.LeakyReLU(0.01),
             nn.Linear(128, 1)
         )
-        # Better weight initialization
+        # Safer initialization
         for layer in net:
             if isinstance(layer, nn.Linear):
-                nn.init.kaiming_normal_(layer.weight, mode='fan_in', nonlinearity='leaky_relu')
+                nn.init.xavier_uniform_(layer.weight, gain=nn.init.calculate_gain('leaky_relu', 0.01))
                 nn.init.constant_(layer.bias, 0)
         print(f"Q-network structure: {net}")
         return net
@@ -296,6 +306,21 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', log_
                     print(f"State stats: mean={states.mean().item():.2f} ±{states.std().item():.2f}")
                     print(f"Action stats: mean={actions.mean().item():.2f} ±{actions.std().item():.2f}")
                     
+                    # Verify tensor ranges
+                    print(f"State range: {states.min().item():.1f} to {states.max().item():.1f}")
+                    print(f"Action range: {actions.min().item():.1f} to {actions.max().item():.1f}")
+                    
+                    # Add numerical stability checks
+                    if torch.any(torch.isnan(states)) or torch.any(torch.isinf(states)):
+                        print("Invalid states detected:")
+                        print(states)
+                        raise ValueError("NaN/Inf in states")
+
+                    if torch.any(actions < 0) or torch.any(actions > 5):
+                        print("Invalid actions detected:")
+                        print(actions)
+                        raise ValueError("Actions outside [0,5] range")
+                    
                     # Add NaN checks
                     if torch.isnan(states).any() or torch.isnan(actions).any():
                         print("NaN detected in input data!")
@@ -321,6 +346,10 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', log_
                     current_q1 = agent.q1(state_action)
                     current_q2 = agent.q2(state_action)
                     
+                    # Add output value clamping
+                    current_q1 = torch.clamp(current_q1, -10, 10)
+                    current_q2 = torch.clamp(current_q2, -10, 10)
+                    
                     print(f"Q1 values: min={current_q1.min().item():.4f}, max={current_q1.max().item():.4f}, mean={current_q1.mean().item():.4f}")
                     
                     with torch.no_grad():
@@ -330,14 +359,23 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', log_
                         q_next = torch.min(q1_next, q2_next)
                         target_q = rewards + 0.99 * (1 - dones) * q_next
                         target_q = torch.clamp(target_q, -10.0, 10.0)  # Absolute bounds
+                        
+                        # Add target value sanitization
+                        target_q = torch.nan_to_num(target_q, nan=0.0, posinf=10.0, neginf=-10.0)
                     
                     # Add target value checks
                     print(f"Target Q stats: min={target_q.min().item():.2f}, max={target_q.max().item():.2f}")
                     
+                    # Add action/value logging
+                    print(f"Q1 outputs: {current_q1.detach().cpu().numpy()[:5]}")  # Show first 5 values
+                    print(f"Target Q: {target_q.detach().cpu().numpy()[:5]}")
+                    print(f"Rewards: {rewards.detach().cpu().numpy()[:5]}")
+                    print(f"Dones: {dones.detach().cpu().numpy()[:5]}")
+                    
                     # Huber loss for critic (more robust than MSE)
-                    q1_loss = F.huber_loss(current_q1, target_q, delta=2.0)
-                    q2_loss = F.huber_loss(current_q2, target_q, delta=2.0)
-                    critic_loss = q1_loss + q2_loss
+                    q1_loss = F.huber_loss(current_q1, target_q, delta=1.0)  # Reduced delta
+                    q2_loss = F.huber_loss(current_q2, target_q, delta=1.0)
+                    critic_loss = (q1_loss + q2_loss) * 0.5  # Added averaging
                     
                     # Add gradient scaling for critic
                     scale_gradients = lambda x: x * 0.5  # Scale gradients before clipping
