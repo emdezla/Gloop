@@ -3,6 +3,7 @@ import seaborn as sns
 import numpy as np
 import pandas as pd
 from sklearn.decomposition import PCA
+from torch.utils.data import Dataset, DataLoader
 
 class DiabetesDataset(Dataset):
     """Processed diabetes management dataset"""
@@ -66,7 +67,7 @@ class DiabetesDataset(Dataset):
             'next_state': torch.FloatTensor(self.next_states[idx]),
             'done': torch.FloatTensor([self.dones[idx]])
         }
-        
+
 def evaluate_dataset_coverage(dataset, n_samples=1000):
     """Evaluate state and action coverage of DiabetesDataset"""
     # Convert to pandas DataFrame for easier analysis
