@@ -15,6 +15,15 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from tqdm import tqdm
 from datetime import datetime
+from torch import nn
+
+# Add Mish activation function for better gradient flow
+class Mish(nn.Module):
+    def forward(self, x):
+        return x * torch.tanh(F.softplus(x))
+
+# Register Mish as a module
+nn.Mish = Mish
 
 # --------------------------
 # Data Handling
@@ -144,15 +153,15 @@ class SACAgent(nn.Module):
     def __init__(self, state_dim=8, action_dim=1):
         super().__init__()
         
-        # Actor Network
+        # Actor Network with improved architecture
         self.actor = nn.Sequential(
-            nn.Linear(state_dim, 128),
+            nn.Linear(state_dim, 256),
+            nn.LayerNorm(256),
+            nn.Mish(),  # Better than Tanh for gradient flow
+            nn.Linear(256, 128),
             nn.LayerNorm(128),
-            nn.Tanh(),
-            nn.Linear(128, 64),
-            nn.LayerNorm(64),
-            nn.Tanh(),
-            nn.Linear(64, action_dim)
+            nn.Mish(),
+            nn.Linear(128, action_dim)
         )
         
         # Initialize weights properly
@@ -172,23 +181,25 @@ class SACAgent(nn.Module):
         self.q2_target.load_state_dict(self.q2.state_dict())
         
         # Entropy regularization
-        self.target_entropy = -torch.prod(torch.Tensor([1])).item()  # For continuous action space
-        self.log_alpha = torch.tensor([0.0], requires_grad=True)
+        self.target_entropy = -torch.prod(torch.Tensor([1])).item() * 2  # Increased exploration
+        self.log_alpha = torch.tensor([1.0], requires_grad=True)  # Start with higher entropy
         
-        # Separate optimizers for actor and critic
-        self.actor_optim = optim.Adam(self.actor.parameters(), lr=3e-5)
+        # Separate optimizers for actor and critic with adjusted learning rates
+        self.actor_optim = optim.Adam(self.actor.parameters(), lr=1e-5)  # Reduced from 3e-5
         self.critic_optim = optim.Adam(
-            list(self.q1.parameters()) + list(self.q2.parameters()), lr=3e-5)
-        self.alpha_optim = optim.Adam([self.log_alpha], lr=1e-4)
+            list(self.q1.parameters()) + list(self.q2.parameters()), lr=1e-4)  # Increased from 3e-5
+        self.alpha_optim = optim.Adam([self.log_alpha], lr=3e-5)  # Reduced from 1e-4
 
     def _create_q_network(self, state_dim, action_dim):
         """Create more stable Q-network with gradient protections"""
         net = nn.Sequential(
             nn.Linear(state_dim + action_dim, 128),
             nn.LayerNorm(128),  # Add layer normalization
+            nn.Dropout(0.1),  # Add dropout for regularization
             nn.LeakyReLU(0.01),  # Safer than ReLU
             nn.Linear(128, 128),
             nn.LayerNorm(128),
+            nn.Dropout(0.1),  # Add dropout for regularization
             nn.LeakyReLU(0.01),
             nn.Linear(128, 1)
         )
@@ -233,7 +244,7 @@ class ReplayBuffer:
 # Training Core
 # --------------------------
 
-def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models'):
+def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', lr_warmup_epochs=50):
     """Simplified training loop for SAC
     
     Args:
@@ -252,6 +263,11 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models'):
     dataset = DiabetesDataset(dataset_path)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     agent = SACAgent().to(device)
+    
+    # Store initial learning rates for warmup
+    initial_actor_lr = 1e-5
+    initial_critic_lr = 1e-4
+    initial_alpha_lr = 3e-5
     
     # Add logging setup
     log_dir = Path("training_logs")
@@ -276,6 +292,16 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models'):
             epoch_action_std = 0.0
             epoch_entropy = 0.0
             epoch_grad_norm = 0.0
+            
+            # Learning rate warmup
+            if epoch < lr_warmup_epochs:
+                warmup_factor = (epoch + 1) / lr_warmup_epochs
+                for param_group in agent.actor_optim.param_groups:
+                    param_group['lr'] = initial_actor_lr * warmup_factor
+                for param_group in agent.critic_optim.param_groups:
+                    param_group['lr'] = initial_critic_lr * warmup_factor
+                for param_group in agent.alpha_optim.param_groups:
+                    param_group['lr'] = initial_alpha_lr * warmup_factor
             
             for batch in dataloader:
                 # Prepare batch
@@ -302,11 +328,25 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models'):
                 q2_loss = F.mse_loss(current_q2, target_q)
                 critic_loss = q1_loss + q2_loss
                 
+                # Add gradient penalty to prevent critic collapse
+                states.requires_grad_(True)
+                q_penalty = agent.q1(torch.cat([states, actions.detach()], 1))
+                grad_penalty = torch.autograd.grad(
+                    outputs=q_penalty.mean(),
+                    inputs=states,
+                    create_graph=True
+                )[0].pow(2).mean()
+                critic_loss += 0.5 * grad_penalty
+                states.requires_grad_(False)
+                
                 # Capture Q-values
                 current_q1_mean = current_q1.mean().item()
                 current_q2_mean = current_q2.mean().item()
                 epoch_q1_value += current_q1_mean
                 epoch_q2_value += current_q2_mean
+                
+                # Scale rewards for more stable learning
+                scaled_rewards = rewards / 5.0  # Scale down rewards
                 
                 agent.critic_optim.zero_grad()
                 critic_loss.backward()
@@ -324,8 +364,13 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models'):
                 # Get current alpha value
                 alpha = agent.log_alpha.exp().detach()
                 
-                # Actor loss with entropy term
+                # Actor loss with entropy term and gradient stabilization
                 actor_loss = -(torch.min(q1_pred, q2_pred)).mean()
+                
+                # Add L2 regularization to actor loss
+                l2_reg = 0.001
+                for param in agent.actor.parameters():
+                    actor_loss += l2_reg * param.pow(2).sum()
                 
                 # Capture action statistics
                 with torch.no_grad():
@@ -346,15 +391,16 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models'):
                 epoch_grad_norm += grad_norm
                 agent.actor_optim.step()
                 
-                # Alpha (temperature) update
-                alpha_loss = -(agent.log_alpha * (agent.target_entropy + torch.tensor(0.1))).mean()
+                # Alpha (temperature) update with more stable target
+                alpha_loss = -(agent.log_alpha * (agent.target_entropy + torch.tensor(0.5))).mean()
                 
                 agent.alpha_optim.zero_grad()
                 alpha_loss.backward()
                 agent.alpha_optim.step()
                 
-                # Update target networks
-                agent.update_targets()
+                # Update target networks less frequently to stabilize learning
+                if epoch % 2 == 0:  # Update targets every 2 epochs
+                    agent.update_targets()
                 
                 # Track losses
                 epoch_critic_loss += critic_loss.item()
@@ -470,6 +516,8 @@ if __name__ == "__main__":
                         help='Batch size for training')
     parser.add_argument('--save_path', type=str, default="models", 
                         help='Directory to save the trained model')
+    parser.add_argument('--lr_warmup', type=int, default=50,
+                        help='Number of epochs for learning rate warmup')
     
     args = parser.parse_args()
     
@@ -478,7 +526,8 @@ if __name__ == "__main__":
         dataset_path=args.dataset,
         epochs=args.epochs,
         batch_size=args.batch_size,
-        save_path=args.save_path
+        save_path=args.save_path,
+        lr_warmup_epochs=args.lr_warmup
     )
     
     # Run analysis on training logs
