@@ -138,8 +138,7 @@ class SACAgent(nn.Module):
         
         # Learning rate scheduler
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, 'min', patience=5, factor=0.5, verbose=True
-        )
+            self.optimizer, 'min', patience=5, factor=0.5)
 
     def _create_q_network(self, state_dim, action_dim):
         """Create Q-network with simpler architecture"""
