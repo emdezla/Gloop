@@ -24,6 +24,13 @@ class DiabetesDataset(Dataset):
     def __init__(self, csv_file):
         df = pd.read_csv(csv_file)
         
+        # Handle missing values by forward-filling and backward-filling
+        df = df.ffill().bfill()
+        
+        # Verify no remaining NaNs
+        if df[["glu", "glu_d", "glu_t", "hr", "hr_d", "hr_t", "iob", "hour"]].isna().any().any():
+            raise ValueError("Dataset contains NaN values after preprocessing")
+        
         # State features (8 dimensions)
         self.states = df[["glu", "glu_d", "glu_t", "hr", "hr_d", "hr_t", "iob", "hour"]].values.astype(np.float32)
         
@@ -41,7 +48,9 @@ class DiabetesDataset(Dataset):
         self._sanitize_transitions()
 
     def _compute_rewards(self, glucose_next):
-        """Risk Index-based reward calculation"""
+        """Risk Index-based reward calculation with NaN handling"""
+        # Handle NaN values by replacing with a safe default
+        glucose_next = np.nan_to_num(glucose_next, nan=100.0)
         glucose_next = np.clip(glucose_next, 1e-6, None)
         log_term = np.log(glucose_next) ** 1.084
         risk_index = 10 * (1.509 * (log_term - 5.381)) ** 2
@@ -90,6 +99,16 @@ class SACAgent(nn.Module):
         )
         self.mean = nn.Linear(128, action_dim)
         self.log_std = nn.Linear(128, action_dim)
+        
+        # Initialize weights properly
+        for layer in self.actor:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_normal_(layer.weight)
+                nn.init.constant_(layer.bias, 0)
+        nn.init.xavier_normal_(self.mean.weight)
+        nn.init.constant_(self.mean.bias, 0)
+        nn.init.xavier_normal_(self.log_std.weight)
+        nn.init.constant_(self.log_std.bias, 0)
         
         # Twin Q-networks
         self.q1 = self._create_q_network(state_dim, action_dim)
@@ -224,12 +243,29 @@ def train_sac(dataset_path, epochs=200, batch_size=256, save_path='sac_model.pth
                     
                     # Combined update
                     total_loss = critic_loss + actor_loss
+                    
+                    # Check for NaN in loss
+                    if torch.isnan(total_loss).any():
+                        print("NaN detected in loss, skipping update")
+                        continue
+                        
                     agent.optimizer.zero_grad()
                     total_loss.backward()
                     
-                    # Gradient monitoring
+                    # Gradient monitoring and clipping
                     grad_norm = torch.nn.utils.clip_grad_norm_(agent.parameters(), 1.0)
                     
+                    # Check for NaN in gradients
+                    has_nan_grad = False
+                    for param in agent.parameters():
+                        if param.grad is not None and torch.isnan(param.grad).any():
+                            has_nan_grad = True
+                            break
+                    
+                    if has_nan_grad:
+                        print("NaN detected in gradients, skipping update")
+                        continue
+                        
                     agent.optimizer.step()
                     agent.update_targets()
                     
@@ -303,12 +339,26 @@ def analyze_training_log(log_path="training_logs/training_log.csv", output_dir="
     print(f"Analysis plots saved to {output_dir}")
 
 if __name__ == "__main__":
-    # Example usage
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Train SAC-CQL agent for diabetes management')
+    parser.add_argument('--dataset', type=str, default="datasets/processed/563-train.csv", 
+                        help='Path to the training dataset')
+    parser.add_argument('--epochs', type=int, default=200, 
+                        help='Number of training epochs')
+    parser.add_argument('--save_path', type=str, default="sac_model.pth", 
+                        help='Path to save the trained model')
+    parser.add_argument('--log_dir', type=str, default="training_logs", 
+                        help='Directory to save training logs')
+    
+    args = parser.parse_args()
+    
+    # Example usage with command line arguments
     agent = train_sac(
-        dataset_path="datasets/processed/563-train.csv",
-        epochs=200,
-        save_path="sac_model.pth",
-        log_dir="training_logs"
+        dataset_path=args.dataset,
+        epochs=args.epochs,
+        save_path=args.save_path,
+        log_dir=args.log_dir
     )
     
     # Analyze training results
