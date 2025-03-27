@@ -1,18 +1,18 @@
 from helpers import *
 from basic_offline_training import SimpleSAC, train_basic
 from SAC_training import SACAgent, train_sac_offline
+from SACCQL_training import SACCQL, train_saccql
 
 if __name__ == "__main__":
-    # Configuration for original complex model with improved stability parameters
-    complex_config = {
+    # Configuration for consolidated SAC-CQL model
+    saccql_config = {
         "dataset_path": "datasets/processed/563-train.csv",
-        "csv_file": "complex_training_stats.csv",
+        "csv_file": "saccql_training_stats.csv",
         "epochs": 200,
-        "batch_size": 256,  # Reduced batch size for better stability
+        "batch_size": 256,
         "device": device,
-        "cql_weight": 0.01,  # Slightly increased
-        "alpha": 0.1,  # Reduced from 0.2 for more conservative exploration
-        "tau": 0.005  # More conservative target update rate
+        "cql_weight": 0.1,
+        "save_path": "sac_cql_final.pth"
     }
     
     # Configuration for simplified model
@@ -45,26 +45,19 @@ if __name__ == "__main__":
         batch_size=simple_config["batch_size"]
     )
     """
-    # Option 2: Train the complex model (if needed)
-
-    print("Training complex SACCQL model...")
-    complex_model = SACCQL()
-    trained_complex_model = train_offline(
-        dataset_path=complex_config["dataset_path"],
-        model=complex_model,
-        csv_file=complex_config["csv_file"],
-        epochs=complex_config["epochs"],
-        batch_size=complex_config["batch_size"],
-        device=complex_config["device"],
-        alpha=complex_config["alpha"],
-        cql_weight=complex_config["cql_weight"],
-        tau=complex_config["tau"]
-    )
     
-    # Save checkpoints at different intervals
-    torch.save(trained_complex_model.state_dict(), "sac_cql_final.pth")
-    print(f"Model saved to sac_cql_final.pth")
-
+    # Option 2: Train the consolidated SAC-CQL model
+    print("Training consolidated SAC-CQL model...")
+    trained_model = train_saccql(
+        dataset_path=saccql_config["dataset_path"],
+        epochs=saccql_config["epochs"],
+        batch_size=saccql_config["batch_size"],
+        save_path=saccql_config["save_path"],
+        csv_file=saccql_config["csv_file"],
+        device=saccql_config["device"],
+        cql_weight=saccql_config["cql_weight"]
+    )
+    print(f"Model saved to {saccql_config['save_path']}")
     
     # Option 3: Train the LSTM-based SAC model
     """
