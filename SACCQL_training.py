@@ -143,11 +143,15 @@ class SACAgent(nn.Module):
 
     def _create_q_network(self, state_dim, action_dim):
         """Create Q-network with simpler architecture"""
-        return nn.Sequential(
+        net = nn.Sequential(
             nn.Linear(state_dim + action_dim, 128),
             nn.ReLU(),
             nn.Linear(128, 1)
         )
+        # Initialize final layer weights
+        nn.init.uniform_(net[-1].weight, -3e-3, 3e-3)
+        nn.init.constant_(net[-1].bias, 0)
+        return net
 
     def forward(self, state):
         """Action selection with entropy regularization"""
@@ -157,14 +161,16 @@ class SACAgent(nn.Module):
         return mean, log_std
 
     def act(self, state, deterministic=False):
-        """Safe action selection with clamping"""
+        """Proper action scaling"""
         mean, log_std = self.forward(state)
+        std = log_std.exp()
+        dist = torch.distributions.Normal(mean, std)
+        
         if deterministic:
             action = torch.tanh(mean) * self.action_scale
         else:
-            std = log_std.exp()
-            dist = torch.distributions.Normal(mean, std)
             action = torch.tanh(dist.rsample()) * self.action_scale
+            
         return action
 
     def update_targets(self, tau=0.05):  # Changed from 0.005 to 0.05
@@ -293,7 +299,7 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', log_
                     action_samples = torch.tanh(dist.rsample()) * agent.action_scale  # Add action scaling
                     
                     # Proper Gaussian entropy calculation
-                    entropy = 0.5 * (1.0 + torch.log(2 * torch.tensor(np.pi)) + 2 * log_std).mean()
+                    entropy = 0.5 * (1.0 + torch.log(2 * torch.tensor(np.pi)) + log_std).mean()
                     
                     # Use adaptive entropy regularization
                     alpha = torch.exp(agent.log_alpha).detach()
