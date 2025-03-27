@@ -36,8 +36,8 @@ class DiabetesDataset(Dataset):
         # State features (8 dimensions)
         self.states = df[["glu", "glu_d", "glu_t", "hr", "hr_d", "hr_t", "iob", "hour"]].values.astype(np.float32)
         
-        # Actions (2 dimensions)
-        self.actions = df[["basal", "bolus"]].values.astype(np.float32)
+        # Single action dimension
+        self.actions = df["action"].values.astype(np.float32).reshape(-1, 1)  # Changed from 2 columns
         
         # Rewards computed from next glucose values
         self.rewards = self._compute_rewards(df["glu_raw"].values)
@@ -90,7 +90,7 @@ class DiabetesDataset(Dataset):
 class SACAgent(nn.Module):
     """Simplified SAC agent for diabetes management"""
     
-    def __init__(self, state_dim=8, action_dim=2):
+    def __init__(self, state_dim=8, action_dim=1):  # Changed action_dim to 1
         super().__init__()
         
         # More stable actor with bounded outputs
@@ -105,7 +105,7 @@ class SACAgent(nn.Module):
         self.mean = nn.Linear(64, action_dim)
         self.log_std = nn.Parameter(torch.zeros(1, action_dim))  # Start from neutral
         self.log_alpha = nn.Parameter(torch.tensor([1.0]))  # Start with higher alpha
-        self.target_entropy = -torch.prod(torch.Tensor([2.0])).item()  # -2.0 for 2D actions
+        self.target_entropy = -torch.prod(torch.Tensor([1.0])).item()  # Updated for 1D action
         self.action_scale = 1.0
         
         # Initialize weights properly
@@ -398,7 +398,7 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', log_
         'optimizer_state_dict': agent.optimizer.state_dict(),
         'model_type': 'SAC',
         'state_dim': 8,
-        'action_dim': 2,
+        'action_dim': 1,
         'training_dataset': os.path.basename(dataset_path),
     }, str(final_model_path))
     print(f"Training complete. Model saved to {final_model_path}")
