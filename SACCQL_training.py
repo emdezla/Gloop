@@ -48,14 +48,22 @@ class DiabetesDataset(Dataset):
         self._sanitize_transitions()
 
     def _compute_rewards(self, glucose_next):
-        """Risk Index-based reward calculation with NaN handling"""
-        # Handle NaN values by replacing with a safe default
+        """Safe reward calculation with numerical stability"""
+        # Ensure valid glucose values
         glucose_next = np.nan_to_num(glucose_next, nan=100.0)
-        glucose_next = np.clip(glucose_next, 1e-6, None)
-        log_term = np.log(glucose_next) ** 1.084
-        risk_index = 10 * (1.509 * (log_term - 5.381)) ** 2
-        rewards = -np.clip(risk_index / 100.0, 0, 1)
-        rewards[glucose_next <= 39] = -15.0  # Severe hypoglycemia penalty
+        glucose_next = np.clip(glucose_next, 40.0, 400.0)  # Realistic physiological range
+        
+        # Compute risk index with stabilized operations
+        with np.errstate(invalid='ignore', divide='ignore'):
+            log_term = np.log(glucose_next/180.0)  # Normalize to typical glucose
+            risk_index = 10 * (1.509 * (log_term**1.084 - 1.861))**2
+            
+        # Convert to tensor for sigmoid, then back to numpy
+        risk_tensor = torch.tensor(risk_index/50.0)
+        rewards = -torch.sigmoid(risk_tensor).numpy()
+        
+        # Apply severe hypoglycemia penalty
+        rewards[glucose_next < 54] = -15.0  # Hypoglycemia threshold
         return rewards.astype(np.float32)
 
     def _sanitize_transitions(self):
@@ -90,25 +98,26 @@ class SACAgent(nn.Module):
     def __init__(self, state_dim=8, action_dim=2):
         super().__init__()
         
-        # Actor network
+        # More stable actor with bounded outputs
         self.actor = nn.Sequential(
-            nn.Linear(state_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU()
+            nn.Linear(state_dim, 128),
+            nn.LayerNorm(128),
+            nn.Tanh(),
+            nn.Linear(128, 64),
+            nn.LayerNorm(64),
+            nn.Tanh()
         )
-        self.mean = nn.Linear(128, action_dim)
-        self.log_std = nn.Linear(128, action_dim)
+        self.mean = nn.Linear(64, action_dim)
+        self.log_std = nn.Parameter(torch.zeros(1, action_dim))  # Fixed variance
         
         # Initialize weights properly
         for layer in self.actor:
             if isinstance(layer, nn.Linear):
                 nn.init.xavier_normal_(layer.weight)
                 nn.init.constant_(layer.bias, 0)
-        nn.init.xavier_normal_(self.mean.weight)
+        # Initialize outputs with small weights for stability
+        nn.init.uniform_(self.mean.weight, -3e-3, 3e-3)
         nn.init.constant_(self.mean.bias, 0)
-        nn.init.xavier_normal_(self.log_std.weight)
-        nn.init.constant_(self.log_std.bias, 0)
         
         # Twin Q-networks
         self.q1 = self._create_q_network(state_dim, action_dim)
@@ -120,21 +129,28 @@ class SACAgent(nn.Module):
         self.q1_target.load_state_dict(self.q1.state_dict())
         self.q2_target.load_state_dict(self.q2.state_dict())
         
-        # Optimizer
-        self.optimizer = optim.Adam([
-            {'params': self.actor.parameters(), 'lr': 3e-4},
-            {'params': self.mean.parameters(), 'lr': 3e-4},
-            {'params': self.log_std.parameters(), 'lr': 3e-4},
+        # Optimizer with weight decay for regularization
+        self.optimizer = optim.AdamW([
+            {'params': self.actor.parameters(), 'lr': 1e-4},
+            {'params': self.mean.parameters(), 'lr': 1e-4},
+            {'params': self.log_std, 'lr': 1e-4},
             {'params': self.q1.parameters(), 'lr': 3e-4},
             {'params': self.q2.parameters(), 'lr': 3e-4}
-        ])
+        ], weight_decay=1e-4)
+        
+        # Learning rate scheduler
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, 'min', patience=5, factor=0.5, verbose=True
+        )
 
     def _create_q_network(self, state_dim, action_dim):
-        """Create Q-network"""
+        """Create Q-network with normalization for stability"""
         return nn.Sequential(
             nn.Linear(state_dim + action_dim, 256),
+            nn.LayerNorm(256),
             nn.ReLU(),
             nn.Linear(256, 128),
+            nn.LayerNorm(128),
             nn.ReLU(),
             nn.Linear(128, 1)
         )
@@ -143,7 +159,7 @@ class SACAgent(nn.Module):
         """Action selection with entropy regularization"""
         hidden = self.actor(state)
         mean = self.mean(hidden)
-        log_std = torch.clamp(self.log_std(hidden), -5, 2)  # Constrained log_std
+        log_std = torch.clamp(self.log_std, -5, 2)  # Constrained log_std
         return mean, log_std
 
     def act(self, state, deterministic=False):
@@ -207,11 +223,13 @@ def train_sac(dataset_path, epochs=200, batch_size=256, save_path='sac_model.pth
                 }
                 
                 for batch in dataloader:
-                    # Prepare batch
-                    states = batch['state'].to(device)
+                    # Prepare batch with normalization for stability
+                    states_raw = batch['state'].to(device)
+                    states = (states_raw - states_raw.mean(0)) / (states_raw.std(0) + 1e-8)
                     actions = batch['action'].to(device)
                     rewards = batch['reward'].to(device)
-                    next_states = batch['next_state'].to(device)
+                    next_states_raw = batch['next_state'].to(device)
+                    next_states = (next_states_raw - next_states_raw.mean(0)) / (next_states_raw.std(0) + 1e-8)
                     dones = batch['done'].to(device)
                     
                     # Critic update
@@ -219,14 +237,17 @@ def train_sac(dataset_path, epochs=200, batch_size=256, save_path='sac_model.pth
                         next_actions = agent.act(next_states)
                         q1_next = agent.q1_target(torch.cat([next_states, next_actions], 1))
                         q2_next = agent.q2_target(torch.cat([next_states, next_actions], 1))
-                        target_q = rewards + 0.99 * (1 - dones) * torch.min(q1_next, q2_next)
+                        # Clip target values for stability
+                        q_next = torch.min(q1_next, q2_next)
+                        target_q = rewards + 0.99 * (1 - dones) * q_next
+                        target_q = torch.clamp(target_q, -100.0, 0.0)
                     
                     # Current Q estimates
                     current_q1 = agent.q1(torch.cat([states, actions], 1))
                     current_q2 = agent.q2(torch.cat([states, actions], 1))
                     
-                    # TD loss
-                    critic_loss = nn.MSELoss()(current_q1, target_q) + nn.MSELoss()(current_q2, target_q)
+                    # Huber loss for critic (more robust to outliers)
+                    critic_loss = nn.HuberLoss()(current_q1, target_q) + nn.HuberLoss()(current_q2, target_q)
                     
                     # Actor update
                     mean, log_std = agent.forward(states)
@@ -237,9 +258,9 @@ def train_sac(dataset_path, epochs=200, batch_size=256, save_path='sac_model.pth
                     # Entropy calculation
                     entropy = dist.entropy().mean()
                     
-                    # Q-values for policy
+                    # Q-values for policy with entropy regularization
                     q1_policy = agent.q1(torch.cat([states, action_samples], 1))
-                    actor_loss = -q1_policy.mean()
+                    actor_loss = -q1_policy.mean() - 0.2 * entropy  # Add entropy bonus
                     
                     # Combined update
                     total_loss = critic_loss + actor_loss
@@ -301,6 +322,9 @@ def train_sac(dataset_path, epochs=200, batch_size=256, save_path='sac_model.pth
                     'Actor Loss': f"{log_entry['actor_loss']:.3f}",
                     'Q Values': f"{(log_entry['q1_value'] + log_entry['q2_value'])/2:.3f}"
                 })
+                
+                # Update learning rate scheduler
+                agent.scheduler.step(log_entry['critic_loss'])
                 
                 # Save checkpoint
                 if (epoch+1) % 50 == 0:
