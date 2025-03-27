@@ -317,7 +317,7 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models'):
                 agent.actor_optim.step()
                 
                 # Alpha (temperature) update
-                alpha_loss = -(agent.log_alpha * (agent.target_entropy + 0.1).detach()).mean()
+                alpha_loss = -(agent.log_alpha * (agent.target_entropy + torch.tensor(0.1))).mean()
                 
                 agent.alpha_optim.zero_grad()
                 alpha_loss.backward()
