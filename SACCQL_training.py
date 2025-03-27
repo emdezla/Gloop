@@ -5,6 +5,7 @@ Simplified SAC-CQL Training for Diabetes Management
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset, DataLoader
@@ -102,7 +103,8 @@ class SACAgent(nn.Module):
         )
         self.mean = nn.Linear(64, action_dim)
         self.log_std = nn.Parameter(torch.zeros(1, action_dim))  # Start from neutral
-        self.log_alpha = nn.Parameter(torch.tensor([0.0]))  # Learnable temperature parameter
+        self.log_alpha = nn.Parameter(torch.tensor([1.0]))  # Start with higher alpha
+        self.target_entropy = -torch.prod(torch.Tensor([2.0])).item()  # -2.0 for 2D actions
         self.action_scale = 1.0
         
         # Initialize weights properly
@@ -126,10 +128,10 @@ class SACAgent(nn.Module):
         
         # Different learning rates for different components
         self.optimizer = optim.AdamW([
-            {'params': self.actor.parameters(), 'lr': 1e-4},
-            {'params': self.mean.parameters(), 'lr': 1e-4},
-            {'params': self.log_std, 'lr': 3e-5},  # Slower std updates
-            {'params': self.log_alpha, 'lr': 3e-5},  # Slow alpha updates
+            {'params': self.actor.parameters(), 'lr': 1e-5},  # Lower actor LR
+            {'params': self.mean.parameters(), 'lr': 1e-5},
+            {'params': self.log_std, 'lr': 1e-5},
+            {'params': self.log_alpha, 'lr': 1e-4},  # Faster alpha updates
             {'params': self.q1.parameters(), 'lr': 3e-4},  # Faster critics
             {'params': self.q2.parameters(), 'lr': 3e-4}
         ], weight_decay=1e-4)
@@ -195,7 +197,7 @@ class ReplayBuffer:
 # Training Core
 # --------------------------
 
-def train_sac(dataset_path, epochs=200, batch_size=256, save_path='sac_model.pth', log_dir="training_logs"):
+def train_sac(dataset_path, epochs=500, batch_size=512, save_path='pure_sac.pth', log_dir="sac_logs"):
     """Enhanced training loop with detailed logging"""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -257,8 +259,10 @@ def train_sac(dataset_path, epochs=200, batch_size=256, save_path='sac_model.pth
                         target_q = rewards + 0.99 * (1 - dones) * q_next
                         target_q = torch.clamp(target_q, -5.0, current_q1.detach().mean() + 5.0)  # Dynamic range
                     
-                    # Huber loss for critic (more robust to outliers)
-                    critic_loss = nn.HuberLoss()(current_q1, target_q) + nn.HuberLoss()(current_q2, target_q)
+                    # MSE loss for critic (pure SAC)
+                    q1_loss = F.mse_loss(current_q1, target_q)
+                    q2_loss = F.mse_loss(current_q2, target_q)
+                    critic_loss = q1_loss + q2_loss
                     
                     # Actor update
                     mean, log_std = agent.forward(states)
@@ -270,12 +274,11 @@ def train_sac(dataset_path, epochs=200, batch_size=256, save_path='sac_model.pth
                     entropy = 0.5 * (1.0 + torch.log(2 * torch.tensor(np.pi)) + 2 * log_std).mean()
                     
                     # Use adaptive entropy regularization
-                    target_entropy = -torch.tensor(2).item()  # -2 for 2D actions
                     alpha = torch.exp(agent.log_alpha).detach()
                     
                     # Q-values for policy with entropy regularization
                     q1_policy = agent.q1(torch.cat([states, action_samples], 1))
-                    actor_loss = -q1_policy.mean() + 0.2 * (target_entropy - entropy).mean()
+                    actor_loss = -q1_policy.mean() + 0.5 * (entropy - agent.target_entropy).mean()  # Stronger entropy bonus
                     
                     # Combined update
                     total_loss = critic_loss + actor_loss
@@ -290,6 +293,12 @@ def train_sac(dataset_path, epochs=200, batch_size=256, save_path='sac_model.pth
                     
                     # Gradient monitoring and clipping
                     grad_norm = torch.nn.utils.clip_grad_norm_(agent.parameters(), 1.0)
+                    
+                    # Additional gradient clipping for Q-networks
+                    for param in agent.q1.parameters():
+                        param.grad.data.clamp_(-1, 1)
+                    for param in agent.q2.parameters():
+                        param.grad.data.clamp_(-1, 1)
                     
                     # Check for NaN in gradients
                     has_nan_grad = False
@@ -396,8 +405,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Train SAC-CQL agent for diabetes management')
     parser.add_argument('--dataset', type=str, default="datasets/processed/563-train.csv", 
                         help='Path to the training dataset')
-    parser.add_argument('--epochs', type=int, default=200, 
+    parser.add_argument('--epochs', type=int, default=500, 
                         help='Number of training epochs')
+    parser.add_argument('--batch_size', type=int, default=512,
+                        help='Batch size for training')
     parser.add_argument('--save_path', type=str, default="sac_model.pth", 
                         help='Path to save the trained model')
     parser.add_argument('--log_dir', type=str, default="training_logs", 
@@ -409,6 +420,7 @@ if __name__ == "__main__":
     agent = train_sac(
         dataset_path=args.dataset,
         epochs=args.epochs,
+        batch_size=args.batch_size,
         save_path=args.save_path,
         log_dir=args.log_dir
     )
