@@ -328,9 +328,9 @@ def generate_evaluation_plots(states, actions_true, actions_pred, glucose, rewar
 def main():
     """Main function for model evaluation"""
     parser = argparse.ArgumentParser(description='Evaluate SAC-CQL agent for diabetes management')
-    parser.add_argument('--model', type=str, required=True, 
+    parser.add_argument('--model', type=str, default="models/sac_model.pth", 
                         help='Path to the trained model')
-    parser.add_argument('--test_data', type=str, required=True, 
+    parser.add_argument('--test_data', type=str, default="datasets/processed/563-train.csv", 
                         help='Path to the test dataset')
     parser.add_argument('--output_dir', type=str, default="logs/evaluation", 
                         help='Directory to save evaluation results')
