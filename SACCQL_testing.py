@@ -340,7 +340,7 @@ def main():
     parser = argparse.ArgumentParser(description='Evaluate SAC-CQL agent for diabetes management')
     parser.add_argument('--model', type=str, default="models/sac_model.pth", 
                         help='Path to the trained model')
-    parser.add_argument('--test_data', type=str, default="datasets/processed/563-train.csv", 
+    parser.add_argument('--test_data', type=str, default="datasets/processed/563-test.csv", 
                         help='Path to the test dataset')
     parser.add_argument('--output_dir', type=str, default="logs/evaluation", 
                         help='Directory to save evaluation results')
