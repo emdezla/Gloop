@@ -464,10 +464,11 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', lr_w
 # --------------------------
 
 def analyze_training_log(log_path="training_logs/training_log.csv", output_dir="training_analysis"):
-    """Analyze training log and generate visualizations"""
+    """Analyze training log and generate visualizations with clinical insights"""
     from pathlib import Path
     import pandas as pd
     import matplotlib.pyplot as plt
+    import numpy as np
     
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     
@@ -486,12 +487,37 @@ def analyze_training_log(log_path="training_logs/training_log.csv", output_dir="
     # Flatten axes array for easier iteration
     axs = axs.flatten()
     
+    # Define healthy ranges for key metrics
+    healthy_ranges = {
+        'critic_loss': (0.1, 1.0),
+        'actor_loss': (1.5, 3.5),
+        'alpha_loss': (-0.5, 0.5),
+        'q1_value': (-4.5, -0.5),
+        'q2_value': (-4.5, -0.5),
+        'action_mean': (-0.2, 0.2),
+        'action_std': (0.3, 0.6),
+        'entropy': (0.1, 0.5),
+        'grad_norm': (0.1, 5.0)
+    }
+    
     for idx, metric in enumerate(metrics):
         ax = axs[idx]
         ax.plot(df['epoch'], df[metric])
         ax.set_title(metric.replace('_', ' ').title())
         ax.set_xlabel('Epoch')
         ax.grid(True)
+        
+        # Add healthy range shading if defined for this metric
+        if metric in healthy_ranges:
+            low, high = healthy_ranges[metric]
+            ax.axhspan(low, high, alpha=0.2, color='green')
+            
+            # Add warning annotations for values outside healthy range
+            last_value = df[metric].iloc[-1]
+            if last_value < low or last_value > high:
+                ax.annotate('⚠️', xy=(df['epoch'].iloc[-1], last_value), 
+                           xytext=(5, 0), textcoords='offset points',
+                           fontsize=12, color='red')
     
     # Hide empty subplots
     for idx in range(n_metrics, len(axs)):
@@ -501,7 +527,97 @@ def analyze_training_log(log_path="training_logs/training_log.csv", output_dir="
     plt.savefig(Path(output_dir) / "training_metrics.png")
     plt.close()
     
+    # Create a separate plot for Q-value convergence
+    if 'q1_value' in df.columns and 'q2_value' in df.columns:
+        plt.figure(figsize=(10, 6))
+        plt.plot(df['epoch'], df['q1_value'], label='Q1')
+        plt.plot(df['epoch'], df['q2_value'], label='Q2')
+        plt.fill_between(df['epoch'], 
+                         df['q1_value'] - 0.1 * np.abs(df['q1_value']),
+                         df['q1_value'] + 0.1 * np.abs(df['q1_value']),
+                         alpha=0.2, color='blue')
+        plt.title('Q-Network Convergence')
+        plt.xlabel('Epoch')
+        plt.ylabel('Q-Value')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(Path(output_dir) / "q_convergence.png")
+        plt.close()
+    
+    # Generate model readiness report
+    generate_readiness_report(df, output_dir)
+    
     print(f"Analysis plots saved to {output_dir}")
+
+def generate_readiness_report(df, output_dir):
+    """Generate a model readiness report based on training metrics"""
+    from pathlib import Path
+    
+    # Calculate key indicators
+    last_100_epochs = df.iloc[-100:] if len(df) >= 100 else df
+    
+    # Check if critic loss has stabilized
+    critic_loss_std = last_100_epochs['critic_loss'].std()
+    critic_stable = critic_loss_std < 0.1
+    
+    # Check if alpha is maintained above threshold
+    final_20pct = df.iloc[int(len(df)*0.8):]
+    alpha_maintained = (final_20pct['entropy'] > 0.1).all()
+    
+    # Check action std in healthy range
+    action_std_healthy = 0.2 <= df['action_std'].iloc[-1] <= 0.6
+    
+    # Check Q-values in healthy range
+    q_values_healthy = (-4.5 <= df['q1_value'].iloc[-1] <= -0.5 and 
+                        -4.5 <= df['q2_value'].iloc[-1] <= -0.5)
+    
+    # Check Q1/Q2 convergence
+    q_diff = abs(df['q1_value'].iloc[-1] - df['q2_value'].iloc[-1])
+    q_avg = abs((df['q1_value'].iloc[-1] + df['q2_value'].iloc[-1]) / 2)
+    q_convergence = (q_diff / q_avg) < 0.01 if q_avg != 0 else False
+    
+    # Generate report
+    report = [
+        "# Model Readiness Report",
+        "",
+        f"## Training Summary",
+        f"- Total Epochs: {len(df)}",
+        f"- Final Critic Loss: {df['critic_loss'].iloc[-1]:.4f}",
+        f"- Final Actor Loss: {df['actor_loss'].iloc[-1]:.4f}",
+        f"- Final Entropy (α): {df['entropy'].iloc[-1]:.4f}",
+        "",
+        f"## Readiness Checklist",
+        f"- {'✅' if critic_stable else '❌'} Critic loss stabilized for last 100 epochs (std={critic_loss_std:.4f})",
+        f"- {'✅' if alpha_maintained else '❌'} α > 0.1 maintained in final 20% of training",
+        f"- {'✅' if action_std_healthy else '❌'} Action std between 0.2-0.6 (current={df['action_std'].iloc[-1]:.4f})",
+        f"- {'✅' if q_values_healthy else '❌'} Q-values within [-4.5, -0.5] range (Q1={df['q1_value'].iloc[-1]:.4f}, Q2={df['q2_value'].iloc[-1]:.4f})",
+        f"- {'✅' if q_convergence else '❌'} <1% difference between final Q1/Q2 values ({100*q_diff/q_avg if q_avg != 0 else 'N/A'}%)",
+        "",
+        "## Recommendations",
+    ]
+    
+    # Add recommendations based on checks
+    if not critic_stable:
+        report.append("- Continue training until critic loss stabilizes")
+    
+    if not alpha_maintained:
+        report.append("- Adjust target entropy to maintain exploration")
+    
+    if not action_std_healthy:
+        if df['action_std'].iloc[-1] < 0.2:
+            report.append("- Increase exploration by raising target entropy")
+        else:
+            report.append("- Decrease exploration by lowering target entropy")
+    
+    if not q_values_healthy:
+        report.append("- Adjust reward scaling or critic network architecture")
+    
+    if not q_convergence:
+        report.append("- Harmonize Q-networks or increase target network update frequency")
+    
+    # Write report to file
+    with open(Path(output_dir) / "model_readiness.md", 'w') as f:
+        f.write('\n'.join(report))
 
 
 if __name__ == "__main__":
