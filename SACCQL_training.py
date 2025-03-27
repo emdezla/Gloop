@@ -242,6 +242,10 @@ def train_sac(dataset_path, epochs=200, batch_size=256, save_path='sac_model.pth
                     dones = batch['done'].to(device)
                     
                     # Critic update
+                    # Current Q estimates
+                    current_q1 = agent.q1(torch.cat([states, actions], 1))
+                    current_q2 = agent.q2(torch.cat([states, actions], 1))
+                    
                     with torch.no_grad():
                         next_actions = agent.act(next_states)
                         q1_next = agent.q1_target(torch.cat([next_states, next_actions], 1))
@@ -250,10 +254,6 @@ def train_sac(dataset_path, epochs=200, batch_size=256, save_path='sac_model.pth
                         q_next = torch.min(q1_next, q2_next)
                         target_q = rewards + 0.99 * (1 - dones) * q_next
                         target_q = torch.clamp(target_q, -5.0, current_q1.detach().mean() + 5.0)  # Dynamic range
-                    
-                    # Current Q estimates
-                    current_q1 = agent.q1(torch.cat([states, actions], 1))
-                    current_q2 = agent.q2(torch.cat([states, actions], 1))
                     
                     # Huber loss for critic (more robust to outliers)
                     critic_loss = nn.HuberLoss()(current_q1, target_q) + nn.HuberLoss()(current_q2, target_q)
