@@ -10,7 +10,10 @@ import os
 
 
 
-def parse_data(data_type):
+def parse_data(data_type, input_file):
+
+    root = ET.parse(input_file).getroot()
+
     data = []
     if data_type in ['glucose_level', 'finger_stick', 'basal', 'basis_heart_rate', 
                         'basis_gsr', 'basis_skin_temperature', 'basis_air_temperature', 'basis_steps']:
@@ -144,7 +147,7 @@ def choose_value(row, meas_col):
         else:
             return np.nan
 
-def compute_iob(df, DOA_hours=3, interval_min=5):
+def compute_iob(df, DOA_hours=5, interval_min=5):
     """
     Compute the Insulin On Board (IOB) for each row of the DataFrame.
     
@@ -245,3 +248,170 @@ def tia_action(df, tia_col='TIA', action_col='action', eta=4.0, I_max=5.0):
     df[action_col] = np.clip(df[action_col], -1, 1)
     
     return df
+
+# Function to calculate trend (slope over last 30 mins = 6 points)
+def compute_trend(series, window=6):
+    trend = []
+    for i in range(len(series)):
+        if i < window - 1 or series[i - window + 1:i + 1].isna().any():
+            trend.append(np.nan)
+        else:
+            y = series[i - window + 1:i + 1].values.reshape(-1, 1)
+            x = np.arange(window).reshape(-1, 1)
+            model = LinearRegression().fit(x, y)
+            trend.append(model.coef_[0][0])
+    return trend
+
+
+def data_processing (input_file):
+
+    glucose_level = parse_data('glucose_level',input_file) # continuous data
+    basis_heart_rate = parse_data('basis_heart_rate',input_file) #continuous data
+    basal = parse_data('basal',input_file) #sparse data 
+    temp_basal = parse_data('temp_basal',input_file) #Tb #Te #dose
+    bolus = parse_data('bolus',input_file) #Tb #Te #dose #carb_input
+
+    # Convert each measurement array to a DataFrame with proper datetime conversion.
+    dfs = {}
+    global_min = None
+    global_max = None
+
+    measurements = {'glucose_level': glucose_level,'basal': basal,
+                    'basis_heart_rate': basis_heart_rate}
+
+    for name, arr in measurements.items():
+        df = pd.DataFrame(arr, columns=['timestamp', name])
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df = df.sort_values('timestamp').reset_index(drop=True)
+        dfs[name] = df
+        
+        # Update the global min and max timestamps.
+        current_min = df['timestamp'].min()
+        current_max = df['timestamp'].max()
+        if global_min is None or current_min < global_min:
+            global_min = current_min
+        if global_max is None or current_max > global_max:
+            global_max = current_max
+
+    # Force the global start to midnight.
+    global_start = global_min.normalize()
+    global_end = global_max
+
+    # Create a perfect timestamp index with a 5-minute frequency over the full range.
+    perfect_index = pd.date_range(start=global_start, end=global_end, freq='5min')
+    df_perfect = pd.DataFrame({'perfect_timestamp': perfect_index})
+
+
+    # Start with the perfect index DataFrame and then add new columns for each measurement.
+    df_final = df_perfect.copy()
+
+    for meas, df_meas in dfs.items():
+        # Merge the measurement into the perfect index.
+        df_merge = merge_measurement(df_final[['perfect_timestamp']], df_meas, meas)
+        
+        # Apply the function to choose the nearest timestamp and compute the time difference.
+        res = df_merge.apply(lambda row: pd.Series(choose_nearest(row)), axis=1)
+        df_merge[f'{meas}_associated_timestamp'] = res.iloc[:, 0]
+        df_merge[f'{meas}_time_diff_min'] = res.iloc[:, 1]
+        
+        # Choose the measurement value using the threshold condition.
+        df_merge[f'{meas}_final'] = df_merge.apply(lambda row: choose_value(row, meas), axis=1)
+        
+        # Add the measurement columns to the final DataFrame.
+        df_final[meas] = df_merge[f'{meas}_final']
+        df_final[f'{meas}_time_diff_min'] = df_merge[f'{meas}_time_diff_min']
+
+
+    # Forward fill the basal values.
+    df_final['basal'] = df_final['basal'].ffill()
+    # Backward fill the basal values (for the first few rows).
+    df_final['basal'] = df_final['basal'].bfill()
+
+
+    # Create the real_basal column as a copy of the forward-filled basal values.
+    df_final['real_basal'] = df_final['basal'].copy()
+
+    # For each temp_basal episode, overwrite real_basal in that time interval.
+    for row in temp_basal:
+        t_start = pd.to_datetime(row[0])
+        t_end   = pd.to_datetime(row[1])
+        val     = row[2]
+        mask = (df_final['perfect_timestamp'] >= t_start) & (df_final['perfect_timestamp'] <= t_end)
+        df_final.loc[mask, 'real_basal'] = val
+
+
+    df_final['bolus'] = 0.0
+
+    # Process each bolus entry.
+    for row in bolus:
+        t_beg = pd.to_datetime(row[0])
+        t_end = pd.to_datetime(row[1])
+        dose  = float(row[2])
+        
+        if t_beg == t_end:
+            # Single data point: find the perfect timestamp that is closest.
+            diffs = (df_final['perfect_timestamp'] - t_beg).abs()
+            idx = diffs.idxmin()
+            # Optionally, you can decide to only assign if the closest point is within a threshold.
+            df_final.loc[idx, 'bolus'] += dose
+        else:
+            # Distributed bolus: find all perfect timestamps in the interval.
+            mask = (df_final['perfect_timestamp'] >= t_beg) & (df_final['perfect_timestamp'] <= t_end)
+            count = mask.sum()
+            if count > 0:
+                distributed = dose / count
+                df_final.loc[mask, 'bolus'] += distributed
+
+    df_with_iob = compute_iob(df_final)
+    df_with_tia = compute_tia(df_with_iob)
+    df_with_actions = tia_action(df_with_tia)
+    df= df_with_actions.drop(columns=['glucose_level_time_diff_min', 'basal',
+        'basal_time_diff_min', 'basis_heart_rate_time_diff_min'],inplace=False)
+
+    # Derivatives
+    df['glucose_derivative'] = df['glucose_level'].diff()/5  # Difference from previous
+    df['heart_rate_derivative'] = df['basis_heart_rate'].diff()/5
+
+    # Trend columns
+    df['glucose_trend'] = compute_trend(df['glucose_level'])
+    df['heart_rate_trend'] = compute_trend(df['basis_heart_rate'])
+
+    df.rename(columns={
+        "perfect_timestamp":   "time",
+        "glucose_level":       "glu",
+        "basis_heart_rate":    "hr",
+        "real_basal":          "basal",
+        "IOB":                 "iob",
+        "TIA":                 "tia",
+        "glucose_derivative":  "glu_d",
+        "heart_rate_derivative": "hr_d",
+        "glucose_trend":       "glu_t",
+        "heart_rate_trend":    "hr_t"
+    }, inplace=True)
+
+    df["glu_raw"] = df["glu"]
+
+    # Add hour and hour_norm
+    df["hour_day"] = pd.to_datetime(df["time"]).dt.hour
+    df["hour"] = df["hour_day"] / 24.0
+
+    # Define episodes by day (daily episodes)
+    df["day"] = pd.to_datetime(df["time"]).dt.date
+    df["done"] = (df["day"] != df["day"].shift(-1)).astype(int)
+
+    # Drop helper columns if needed
+    df.drop(columns=["hour_day", "day"], inplace=True)
+
+    # Reorder columns
+    ordered_columns = [
+        "time", # Optional timestamp for reference
+        "glu_raw",            
+        "glu", "glu_d", "glu_t",
+        "hr", "hr_d", "hr_t",
+        "iob", "hour",  # <- state features
+        "basal", "bolus", "tia",    # <- clarification features
+        "action",  # <- action feature
+        "done"     # <- episode boundary flag
+    ]
+
+    return df[ordered_columns]
