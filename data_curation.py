@@ -2,6 +2,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
 import pandas as pd
+import torch
 from sklearn.decomposition import PCA
 from torch.utils.data import Dataset, DataLoader
 
