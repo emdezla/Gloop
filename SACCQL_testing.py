@@ -40,15 +40,18 @@ class DiabetesTestDataset(DiabetesDataset):
         # Validate and clean action values
         self.actions = np.clip(df["action"].values.astype(np.float32), -1, 1)
         
-    def __getitem__(self, idx):
-        """Override parent's __getitem__ to properly handle tensor creation"""
-        return {
-            'state': torch.FloatTensor(self.states[idx]),
-            'action': torch.tensor(self.actions[idx], dtype=torch.float32),
-            'reward': torch.FloatTensor([self.rewards[idx]]),
-            'next_state': torch.FloatTensor(self.next_states[idx]),
-            'done': torch.FloatTensor([float(self.dones[idx])])
-        }
+    def __init__(self, csv_file):
+        super().__init__(csv_file)
+        # Store raw glucose values for evaluation
+        df = pd.read_csv(csv_file)
+        
+        # Add comprehensive NaN handling
+        if df["action"].isna().any():
+            print("Warning: NaN actions detected - filling with 0")
+            df["action"] = df["action"].fillna(0)
+            
+        # Validate and clean action values
+        self.actions = np.clip(df["action"].values.astype(np.float32), -1, 1)
         
         # Add full data validation
         self.glucose_raw = self._validate_glucose(df["glu_raw"].values)
@@ -67,6 +70,16 @@ class DiabetesTestDataset(DiabetesDataset):
         
         # Calculate glycemic variability metrics
         self.glycemic_metrics = self._calculate_glycemic_variability(self.glucose_raw)
+        
+    def __getitem__(self, idx):
+        """Override parent's __getitem__ to properly handle tensor creation"""
+        return {
+            'state': torch.FloatTensor(self.states[idx]),
+            'action': torch.tensor(self.actions[idx], dtype=torch.float32),
+            'reward': torch.FloatTensor([self.rewards[idx]]),
+            'next_state': torch.FloatTensor(self.next_states[idx]),
+            'done': torch.FloatTensor([float(self.dones[idx])])
+        }
         
     def _validate_glucose(self, values):
         """Ensure valid glucose values with NaN handling"""
