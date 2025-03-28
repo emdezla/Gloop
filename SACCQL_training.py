@@ -247,26 +247,6 @@ class ReplayBuffer:
 # Training Core
 # --------------------------
 
-class EarlyStopping:
-    """Stop training when critic loss hasn't improved for given patience"""
-    def __init__(self, patience=50, min_delta=0.001):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.best_loss = float('inf')
-        self.counter = 0
-        self.epochs_since_improvement = 0
-
-    def __call__(self, current_loss):
-        if current_loss < (self.best_loss - self.min_delta):
-            self.best_loss = current_loss
-            self.counter = 0
-            self.epochs_since_improvement = 0
-            return False
-        else:
-            self.counter += 1
-            self.epochs_since_improvement += 1
-            return self.epochs_since_improvement >= self.patience
-
 def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', lr_warmup_epochs=50,
               use_cql=False, cql_alpha=1.0):
     """Simplified training loop for SAC
@@ -304,9 +284,6 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', lr_w
     dataset_std = torch.FloatTensor(all_states.std(axis=0)).to(device)
     dataset_std[dataset_std < 1e-4] = 1.0
     
-    # Initialize early stopping
-    early_stopping = EarlyStopping(patience=50, min_delta=0.0001)
-    
     # Store initial learning rates for warmup
     initial_actor_lr = 5e-6
     initial_critic_lr = 2e-4
@@ -336,12 +313,6 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', lr_w
             epoch_entropy = 0.0
             epoch_grad_norm = 0.0
             
-            # Check for early stopping
-            if epoch >= 100:  # Only start checking after 100 epochs
-                if early_stopping(epoch_critic_loss):
-                    print(f"\nEarly stopping at epoch {epoch} - No critic loss improvement for 50 epochs")
-                    break
-                    
             # Learning rate warmup
             if epoch < lr_warmup_epochs:
                 warmup_factor = (epoch + 1) / lr_warmup_epochs
