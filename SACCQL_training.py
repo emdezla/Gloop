@@ -75,51 +75,35 @@ class DiabetesDataset(Dataset):
         self._sanitize_transitions()
 
     def _compute_rewards(self, glucose_next):
-        """Robust reward calculation with numerical safeguards"""
-        # Add debug output for first 5 values
-        print(f"Sample glu_raw inputs: {glucose_next[:5]}")
+        """Target-centered reward function with safe zones"""
+        glucose = np.clip(glucose_next.astype(np.float32), 40, 400)
         
-        # Convert to numpy array explicitly
-        glucose_next = np.asarray(glucose_next, dtype=np.float32)
+        # Base penalty (quadratic around target 100)
+        target = 100.0
+        dev_penalty = ((glucose - target) ** 2) / (target ** 2)  # Normalized
         
-        # Handle remaining NaNs if any
-        if np.isnan(glucose_next).any():
-            print("Warning: NaN in glucose_next - replacing with 180 (nominal)")
-            glucose_next = np.nan_to_num(glucose_next, nan=180.0)
-
-        # Safer clipping with type preservation
-        glucose_next = np.clip(glucose_next.astype(np.float32), 40, 400)
-        
-        # Stable log calculation
-        safe_ratio = np.where(
-            glucose_next > 0,
-            glucose_next / 180.0,
-            1e-4  # Avoid zero division
+        # Hypoglycemia penalty (starts below 70)
+        hypo_penalty = np.where(
+            glucose < 70,
+            (70 - glucose) * 0.03,  # Gentle linear slope
+            0.0
         )
-        log_term = np.log(safe_ratio + 1e-8)
         
-        # Vectorized risk calculation
-        with np.errstate(invalid='ignore'):
-            risk_index = 10 * (1.509 * (log_term**1.084 - 1.861)**2)
-            risk_index = np.nan_to_num(risk_index, nan=50.0, posinf=50.0, neginf=0.0)
+        # Hyperglycemia penalty (starts above 180)
+        hyper_penalty = np.where(
+            glucose > 180,
+            (glucose - 180) * 0.02,  # Milder slope for hyper
+            0.0
+        )
         
-        # Reward calculation with failsafes
-        rewards = -risk_index / (np.clip(risk_index, 1e-8, None) + 50)  # Prevent div by zero
-        rewards = np.clip(rewards, -5.0, 0.0).astype(np.float32)
+        # Combined reward with Q-value scaling control
+        rewards = -(dev_penalty + hypo_penalty + hyper_penalty) * 0.5  # Critical scaling factor
+        rewards = np.clip(rewards, -2.0, 0.0).astype(np.float32)
         
-        # Hypoglycemia penalty with index check
-        hypo_mask = glucose_next < 54
-        rewards[hypo_mask] = -5.0
+        # Add small time penalty to encourage control
+        rewards -= 0.01  # Adjustable agent "effort" penalty
         
-        # Add debug output for first 5 rewards
-        print(f"Sample rewards: {rewards[:5]}")
-        
-        # Final validation
-        if np.isnan(rewards).any():
-            nan_indices = np.where(np.isnan(rewards))[0]
-            raise ValueError(f"NaN rewards at indices: {nan_indices}")
-            
-        return rewards
+        return np.clip(rewards, -2.0, 0.0)
 
     def _sanitize_transitions(self):
         """Remove invalid transitions and align array lengths"""
@@ -263,8 +247,7 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', lr_w
     Returns:
         Trained SAC agent
     """
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Training on device: {device}")
+
     
     # Generate timestamp once at start of training
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -675,6 +658,9 @@ if __name__ == "__main__":
                         help='Weight for CQL penalty term')
     
     args = parser.parse_args()
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Training on device: {device}")
     
     # Train the agent
     agent = train_sac(
