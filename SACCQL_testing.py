@@ -40,6 +40,16 @@ class DiabetesTestDataset(DiabetesDataset):
         # Validate and clean action values
         self.actions = np.clip(df["action"].values.astype(np.float32), -1, 1)
         
+    def __getitem__(self, idx):
+        """Override parent's __getitem__ to properly handle tensor creation"""
+        return {
+            'state': torch.FloatTensor(self.states[idx]),
+            'action': torch.tensor(self.actions[idx], dtype=torch.float32),
+            'reward': torch.FloatTensor([self.rewards[idx]]),
+            'next_state': torch.FloatTensor(self.next_states[idx]),
+            'done': torch.FloatTensor([float(self.dones[idx])])
+        }
+        
         # Add full data validation
         self.glucose_raw = self._validate_glucose(df["glu_raw"].values)
         
