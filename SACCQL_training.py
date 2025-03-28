@@ -628,7 +628,7 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description='Train SAC agent for diabetes management')
-    parser.add_argument('--dataset', type=str, default="datasets/processed/563-training.csv", 
+    parser.add_argument('--dataset', type=str, default="datasets/processed/full-training.csv", 
                         help='Path to the training dataset')
     parser.add_argument('--epochs', type=int, default=500, 
                         help='Number of training epochs')
