@@ -185,9 +185,9 @@ class SACAgent(nn.Module):
         self.log_alpha = torch.tensor([1.0], requires_grad=True)  # Start with higher entropy
         
         # Separate optimizers for actor and critic with adjusted learning rates
-        self.actor_optim = optim.Adam(self.actor.parameters(), lr=5e-6)  # Reduced from 1e-5
+        self.actor_optim = optim.Adam(self.actor.parameters(), lr=1e-5)  # Increased from 5e-6
         self.critic_optim = optim.Adam(
-            list(self.q1.parameters()) + list(self.q2.parameters()), lr=2e-4)  # Increased from 1e-4
+            list(self.q1.parameters()) + list(self.q2.parameters()), lr=1e-4)  # Reduced from 2e-4
         self.alpha_optim = optim.Adam([self.log_alpha], lr=1e-5)  # Reduced from 3e-5
 
     def _create_q_network(self, state_dim, action_dim):
@@ -267,7 +267,8 @@ class EarlyStopping:
             self.epochs_since_improvement += 1
             return self.epochs_since_improvement >= self.patience
 
-def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', lr_warmup_epochs=50):
+def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', lr_warmup_epochs=50,
+              use_cql=False, cql_alpha=1.0):
     """Simplified training loop for SAC
     
     Args:
@@ -275,6 +276,9 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', lr_w
         epochs: Number of training epochs
         batch_size: Batch size for training
         save_path: Path to save the trained model
+        lr_warmup_epochs: Number of epochs for learning rate warmup
+        use_cql: Whether to use Conservative Q-Learning penalty
+        cql_alpha: Weight for CQL penalty term
         
     Returns:
         Trained SAC agent
@@ -290,6 +294,15 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', lr_w
     dataset = DiabetesDataset(dataset_path)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     agent = SACAgent().to(device)
+    
+    # Compute dataset-wide mean/std for state normalization
+    all_states = []
+    for i in range(len(dataset)):
+        all_states.append(dataset[i]['state'].numpy())
+    all_states = np.vstack(all_states)
+    dataset_mean = torch.FloatTensor(all_states.mean(axis=0)).to(device)
+    dataset_std = torch.FloatTensor(all_states.std(axis=0)).to(device)
+    dataset_std[dataset_std < 1e-4] = 1.0
     
     # Initialize early stopping
     early_stopping = EarlyStopping(patience=50, min_delta=0.0001)
@@ -347,6 +360,10 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', lr_w
                 next_states = batch['next_state'].to(device)
                 dones = batch['done'].to(device)
                 
+                # Normalize states
+                states = (states - dataset_mean) / (dataset_std + 1e-8)
+                next_states = (next_states - dataset_mean) / (dataset_std + 1e-8)
+                
                 # Critic update
                 with torch.no_grad():
                     next_actions = agent.act(next_states)
@@ -363,6 +380,17 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', lr_w
                 q1_loss = F.mse_loss(current_q1, target_q)
                 q2_loss = F.mse_loss(current_q2, target_q)
                 critic_loss = q1_loss + q2_loss
+                
+                # Conservative Q-Learning (CQL) penalty if enabled
+                if use_cql:
+                    # Sample random actions for CQL
+                    random_actions = 2.0 * torch.rand_like(actions) - 1.0
+                    q1_rand = agent.q1(torch.cat([states, random_actions.detach()], 1))
+                    q2_rand = agent.q2(torch.cat([states, random_actions.detach()], 1))
+                    # Conservative term: log-sum-exp minus the Q on real actions
+                    cql_term = (torch.logsumexp(q1_rand, dim=0).mean() + torch.logsumexp(q2_rand, dim=0).mean()) \
+                              - torch.min(current_q1, current_q2).mean()
+                    critic_loss += cql_alpha * cql_term
                 
                 # Add gradient penalty to prevent critic collapse
                 states.requires_grad_(True)
@@ -404,7 +432,7 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', lr_w
                 actor_loss = -(torch.min(q1_pred, q2_pred)).mean()
                 
                 # Add L2 regularization to actor loss
-                l2_reg = 0.001
+                l2_reg = 0.0005  # Reduced from 0.001
                 for param in agent.actor.parameters():
                     actor_loss += l2_reg * param.pow(2).sum()
                 
@@ -670,6 +698,10 @@ if __name__ == "__main__":
                         help='Directory to save the trained model')
     parser.add_argument('--lr_warmup', type=int, default=50,
                         help='Number of epochs for learning rate warmup')
+    parser.add_argument('--use_cql', action='store_true',
+                        help='Enable Conservative Q-Learning penalty')
+    parser.add_argument('--cql_alpha', type=float, default=1.0,
+                        help='Weight for CQL penalty term')
     
     args = parser.parse_args()
     
@@ -679,7 +711,9 @@ if __name__ == "__main__":
         epochs=args.epochs,
         batch_size=args.batch_size,
         save_path=args.save_path,
-        lr_warmup_epochs=args.lr_warmup
+        lr_warmup_epochs=args.lr_warmup,
+        use_cql=args.use_cql,
+        cql_alpha=args.cql_alpha
     )
     
     # Get the timestamp from the most recent directory in training_logs

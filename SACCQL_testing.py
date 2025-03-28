@@ -40,19 +40,6 @@ class DiabetesTestDataset(DiabetesDataset):
         # Validate and clean action values
         self.actions = np.clip(df["action"].values.astype(np.float32), -1, 1)
         
-    def __init__(self, csv_file):
-        super().__init__(csv_file)
-        # Store raw glucose values for evaluation
-        df = pd.read_csv(csv_file)
-        
-        # Add comprehensive NaN handling
-        if df["action"].isna().any():
-            print("Warning: NaN actions detected - filling with 0")
-            df["action"] = df["action"].fillna(0)
-            
-        # Validate and clean action values
-        self.actions = np.clip(df["action"].values.astype(np.float32), -1, 1)
-        
         # Add full data validation
         self.glucose_raw = self._validate_glucose(df["glu_raw"].values)
         
