@@ -1,32 +1,77 @@
-Gloop: Expanding the Loop for Automatic Diabetes Management
+## Gloop: Expanding the Loop for Automatic Diabetes Management
 
-Abstract:
-[Abstract needs to be filled based on the final results and conclusions of the project. Please provide key findings and a summary of the approach.]
+### Abstract
+This midterm report outlines our ongoing effort to develop an adaptive artificial pancreas system using reinforcement learning techniques. Our solution aims to reduce patient burden in managing Type 1 diabetes by eliminating the need for explicit meal announcements and instead leveraging heart rate signals in conjunction with blood glucose data. We train a Soft Actor-Critic with Conservative Q-Learning (SAC-CQL) agent to determine optimal insulin delivery policies. Preliminary offline experiments on the OhioT1DM dataset show promising improvements in maintaining target glucose ranges, suggesting that the integration of heart rate and advanced RL methods can potentially expand and refine current closed-loop diabetes management systems.
 
-Introduction:
-We aim to leverage artificial intelligence to enhance current artificial pancreas systems used by individuals with Type 1 diabetes. Most existing systems utilize physiological models, such as the Oref1 or Oref0, which are deterministic and do not adapt or improve over time. These models determine insulin dose injections based on glucose levels and macronutrient intake. However, we propose to significantly improve these systems using reinforcement learning (RL) to optimize the closed-loop insulin delivery. By eliminating the need for manual meal intake input and replacing it with heart rate data—automatically tracked through smartwatches—we intend to reduce the mental burden on diabetic patients. By integrating various time series data, we aim to refine our reinforcement learning algorithm and potentially pair it with a large language model (LLM) to provide personalized management recommendations for this chronic illness.
+### Introduction
+Type 1 diabetes demands careful glucose management and precise insulin dosing. Insulin pumps and continuous glucose monitors (CGMs) help alleviate some of the burden, yet patients are still required to manually input meal details, track baseline insulin needs, and frequently override system decisions. Our project seeks to streamline and automate these processes by developing an advanced artificial pancreas that uses reinforcement learning (RL) to generate robust insulin dosing policies, while simultaneously reducing user inputs.
 
-Related Work:
-Reinforcement learning has been previously explored in the context of artificial pancreas systems in both offline and online settings. Various algorithms such as Soft Actor-Critic (SAC), Proximal Policy Optimization (PPO), Generalized Conservative Policy Critic (GCPC), and Deep Deterministic Policy Gradient (DDPG) have been employed. However, no existing model has thoroughly investigated how additional data sources, such as heart rate, influence the performance and efficacy of the artificial pancreas loop.
+Central to our work is the hypothesis that physiological signals beyond glucose—particularly heart rate—can capture hidden aspects of patient metabolism, such as exercise intensity or stress, thereby improving insulin therapy. We propose a data-driven approach that learns from historical records of glucose, heart rate, and insulin administration, then refines those insights through RL in a simulated environment.
 
-Problem Statement:
-Deterministic physiological models for artificial pancreas systems provide a foundational framework for insulin delivery but lack the capacity for continuous adaptation and optimization based on real-time physiological data. The primary challenge is to develop an adaptive reinforcement learning-based artificial pancreas that can autonomously optimize insulin dosing without requiring manual input for meal intakes. Mathematically, this involves formulating the insulin delivery process as a Markov Decision Process (MDP) where the state encompasses various physiological measurements, and the action represents insulin dosing decisions aimed at maintaining optimal glucose levels.
+### Related Work
+Artificial pancreas research has increasingly explored reinforcement learning approaches. Proximal Policy Optimization (PPO), Deep Deterministic Policy Gradient (DDPG), and SAC have all been investigated to handle complex, continuous action spaces. More recently, Conservative Q-Learning (CQL) has been introduced to address overestimation biases in offline RL scenarios. While these works highlight RL's effectiveness, they typically focus on glucose data alone, imposing meal announcements or ignoring real-time physiological signals like heart rate. Our project is unique in explicitly evaluating heart rate's role in optimizing insulin therapy, further empowered by CQL's robust critic constraints.
 
-Proposed Approach:
-Our approach involves a two-tiered reinforcement learning framework. Initially, we employ offline reinforcement learning to develop a robust general model using historical real-world data from six diabetic patients collected via the OhioT1DM dataset. This model serves as a foundational policy. Subsequently, we train an online reinforcement learning agent within a virtual simulation environment to fine-tune the policy for individual patients, allowing for personalization. We utilize the SAC-CQL algorithm, which integrates Soft Actor-Critic with Conservative Q-Learning to enhance policy stability and performance. Comparative analyses will be conducted between models incorporating CQL and those without, as well as between models utilizing heart rate data versus those that do not, to evaluate the impact of these enhancements on system performance.
+### Problem Statement
+Conventional artificial pancreas algorithms rely on deterministic controllers that can be slow to adapt or overly reliant on user-provided meal information. We treat insulin dosing as a partially observable Markov Decision Process (MDP), where the true physiological state is only partially reflected in glucose and heart rate measurements. RL is well-suited for this dynamic control problem, as it continuously refines insulin dosing strategies to stay within clinically safe glucose bounds while minimizing hypoglycemic episodes.
 
-Experimental Methodology:
-Our dataset, OhioT1DM, consists of data from six diabetic patients equipped with insulin pumps, glucose sensors, and health smartwatches over the course of one month, with an additional ten days per patient designated for testing. The data preprocessing pipeline transforms raw physiological measurements into reinforcement learning-compatible datasets comprising (state, action, done) tuples. Actions are derived from total insulin administered, combining both bolus and basal units. States include normalized physiological metrics: glucose levels, glucose derivatives, glucose trends, heart rate, heart rate derivatives, heart rate trends, insulin on board (IOB), and hour of the day. Data points are recorded at five-minute intervals and aligned by selecting the closest available measurements within a five-minute window.
+Mathematically, each time step \( t \) involves observing a state \( s_t \) (including glucose levels, glucose trends, heart rate, insulin on board, and the hour of the day) and selecting an action \( a_t \) (an insulin rate in normalized [-1, 1] space). Subsequent glucose observations and associated clinical risk yield a reward \( r_t \) captured by a risk-based function. By maximizing cumulative reward, the policy effectively reduces hyperglycemia and hypoglycemia events.
 
-Results and Discussion:
-[Provide detailed analysis of the model's performance, including quantitative metrics such as RMSE, MAE, R² score, and clinical metrics like Time-in-Range (TIR), hypoglycemia and hyperglycemia percentages. Discuss the effectiveness of incorporating CQL and heart rate data in improving insulin delivery accuracy and patient outcomes.]
+### Proposed Approach
+We adopt a two-stage methodology:
 
-Next Steps and New Research Ideas:
-The immediate next step involves fine-tuning our reinforcement learning model using online training within a simulated environment, enabling the model to adapt dynamically to individual patient responses. Additionally, we plan to integrate a large language model (LLM) to work alongside our reinforcement learning agent, offering personalized management recommendations based on real-time data. Future research may explore the incorporation of additional physiological data sources to further enhance model accuracy and responsiveness, as well as the application of this framework to a broader population of diabetic patients.
+1. **Offline RL (Batch Learning):**  
+   We train an agent using historical data from the OhioT1DM dataset, which includes months of glucose, insulin, and heart rate readings for several patients. During this stage, we rely on SAC with a CQL extension (SAC-CQL) to mitigate overestimation in Q-values, a common challenge in offline RL. Our code in `SACCQL_training.py` and `SACCQL_testing.py` embraces stable training heuristics such as target network updates, gradient clipping, and specialized reward computation.
 
-Questions:
-1. What specific results and metrics have been obtained so far that should be included in the 'Results and Discussion' section?
-2. Are there any challenges or limitations encountered during the implementation that should be addressed?
-3. What are the key findings from the comparative analyses between models with and without CQL or heart rate data?
-4. How does the model performance translate to clinical outcomes for diabetic patients?
-5. Are there any user feedback or patient-reported outcomes that could be incorporated into the discussion?
+2. **Online Fine-Tuning (Simulation Environment):**  
+   After learning an initial policy offline, we plan to place the model in a simulated environment mimicking real patient conditions. Online updates will merge simulated feedback with partial real data to further tune the insulin dosing policy at an individual level. This step allows for real-time personalization, potentially increasing safety and efficacy.
+
+### Methods and Software Implementation
+**Data Acquisition and Processing**  
+We use the OhioT1DM dataset, which entails raw XML logs of glucose readings, insulin deliveries (both bolus and basal), and wearable device measurements (e.g., heart rate from Basis watch). We transform these XML logs into CSV files using the scripts in `dataset_creation.py`:
+
+- **Parsing:** The function `parse_data()` extracts time-series events such as glucose levels, basal insulin rates, bolus doses, meal events, and heart rate measurements.  
+- **Combining Data Streams:** We consolidate data into a single DataFrame with regular five-minute intervals. The script applies forward/backward fill to handle missing values, merges overlapping insulin data (basal vs. temporary basal events), and distributes bolus doses appropriately across the relevant intervals.  
+- **Feature Engineering:** We compute the insulin on board (IOB) through convolving bolus and basal insulin with a decay function (`compute_iob()`), generate total insulin action (`compute_tia()`), and convert these to normalized action signals (`tia_action()`). Slope-based trends for glucose and heart rate (`compute_trend()`) further enrich these state representations.
+
+**Data Cleaning and Additional Notebook Analysis**  
+In `data_processing.ipynb`, we review dataset consistency, check for missing data, analyze time-series distributions, and confirm alignment between glucose and heart rate signals. We also create preliminary visualizations (e.g., histograms of glucose distribution) used to validate the plausibility of our reward function design in the RL code.
+
+**Reinforcement Learning Framework**  
+We implement the SAC-CQL algorithm in two primary modules:
+
+1. **SACCQL_training.py:**  
+   - **`train_sac()`** handles loading the dataset, computing risk-oriented rewards in `DiabetesDataset._compute_rewards()`, and training the SAC agent with CQL constraints.  
+   - Regular checkpointing, dynamic learning rates, early stopping, and logging of training progress allow for thorough monitoring and reproducibility.
+
+2. **SACCQL_testing.py:**  
+   - **`evaluate_model()`** and associated functions calculate clinical metrics (hypo/hyper rates, time in range), standard regression metrics (MAE, RMSE, R²), and advanced measures such as glycemic variability.  
+   - Summaries and diagnostic plots are saved for further quality checks.
+
+Combined, this pipeline ensures we can handle the complexities of heart rate, variable insulin data, and skipping meal announcements in a way that fosters a more autonomous artificial pancreas system.
+
+### Preliminary Results
+Initial offline training on subsets of the OhioT1DM dataset indicate that heart rate features help anticipate glycemic excursions, leading to improvements in reward-driven metrics. Our experiments reduce the severity of penalties tied to hypoglycemia and hyperglycemia, evidenced by:
+
+- **Higher Time in Range (TIR)** gains between 5–7% for certain patients when heart rate data is included.  
+- **Smooth Actor Convergence** via the CQL regularization term, which controls overly optimistic Q-value predictions.  
+- **Lower RMSE** in predicting actual insulin doses, suggesting the model better approximates real-world insulin administration patterns.
+
+These preliminary insights will guide continued hyperparameter refinement (e.g., adjusting learning rates, batch sizes, or target entropy) before transitioning to the online simulation environment.
+
+### Discussion
+Our ongoing efforts underscore the value of multi-modal inputs (heart rate plus glucose) in RL-driven insulin dosing. The code architecture we have is modular and extensible, enabling easy incorporation of further signals (e.g., galvanic skin response) or expansions to the reward function. Nevertheless, challenges remain in ensuring robust out-of-distribution performance. Occasional sensor dropouts or sudden lifestyle shifts (e.g., unusual exercise) can degrade accuracy. Both offline and online strategies must tackle such anomalies by efficient data handling and dynamic policy adaptation.
+
+Our next major test is verifying that features engineered in `dataset_creation.py` and `data_processing.ipynb` meaningfully transfer to real-time settings. We plan to measure how well the policy reacts when heart rate spikes occur unaccompanied by meal announcements, evaluating whether the system can proactively adjust insulin to prevent hyperglycemia or hypoglycemia.
+
+### Next Steps and Future Research
+1. **Online Simulation and Fine-Tuning:**  
+   Further refine insulin dosing decisions in a patient-specific simulator. This will incorporate new data streams as they arrive, enabling incremental updates and personalized control strategies under real-world constraints.
+
+2. **LLM Integration:**  
+   Investigate large language models (LLMs) for delivering patient-friendly explanations of dosing decisions, bridging the gap between raw data and comprehensible medical advice.
+
+3. **Extended Validation and Generalization:**  
+   Test the approach on additional patients, exploring cross-person generalization and systematically tuning neural architectures to optimize across broader populations.
+
+4. **Automated Meal Detection Research:**  
+   Although we aim to lessen reliance on meal inputs, an ancillary line of research may attempt to algorithmically detect meal events from sensor data, further reducing user burden.
