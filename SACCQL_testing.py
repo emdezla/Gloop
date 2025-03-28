@@ -83,7 +83,9 @@ class DiabetesTestDataset(DiabetesDataset):
         
     def _validate_glucose(self, values):
         """Ensure valid glucose values with NaN handling"""
-        cleaned = pd.Series(values).fillna(method='ffill').fillna(method='bfill').values
+        # Replace deprecated fillna(method=...) with ffill/bfill
+        series = pd.Series(values)
+        cleaned = series.ffill().bfill().values
         if np.isnan(cleaned).any():
             raise ValueError("Could not resolve all NaN values in glucose data")
         return cleaned.astype(np.float32)
@@ -289,8 +291,12 @@ def evaluate_model(model, test_dataset, model_metadata=None, output_dir="logs/ev
             actions_true = torch.stack(batch_actions_true).to(device)
             rewards = torch.stack(batch_rewards).to(device)
             
-            # Normalize states for model input
-            states_norm = (states - states.mean(0)) / (states.std(0) + 1e-8)
+            # Normalize states with safer std calculation
+            states_mean = states.mean(0)
+            states_std = states.std(0)
+            # Replace near-zero std values with 1.0
+            states_std[states_std < 1e-4] = 1.0
+            states_norm = (states - states_mean) / (states_std + 1e-8)
             
             # Get model predictions
             actions_pred = model.act(states_norm)  # Remove deterministic flag
@@ -307,22 +313,32 @@ def evaluate_model(model, test_dataset, model_metadata=None, output_dir="logs/ev
     metrics["inference_time_seconds"] = float(inference_time)
     metrics["inference_time_per_sample"] = float(inference_time / n_samples)
     
-    # Convert to numpy arrays
+    # Convert to numpy arrays and flatten
     all_states = np.array(all_states)
-    all_actions_true = np.array(all_actions_true)
-    all_actions_pred = np.array(all_actions_pred)
-    all_rewards = np.array(all_rewards)
-    all_glucose = np.array(all_glucose)
+    all_actions_true = np.array(all_actions_true).flatten()  # Changed
+    all_actions_pred = np.array(all_actions_pred).flatten()  # Changed
+    all_rewards = np.array(all_rewards).flatten()            # Changed
+    all_glucose = np.array(all_glucose).flatten()            # Changed
     
     # Add NaN validation and masking
-    valid_mask = ~(np.isnan(all_actions_true) | np.isnan(all_actions_pred))
-    if not np.all(valid_mask):
-        print(f"Warning: Filtering {len(valid_mask)-np.sum(valid_mask)} invalid samples with NaN values")
-        all_actions_true = all_actions_true[valid_mask]
-        all_actions_pred = all_actions_pred[valid_mask]
-        all_rewards = all_rewards[valid_mask]
-        all_glucose = all_glucose[valid_mask]
-        all_states = all_states[valid_mask]
+    valid_mask = ~(
+        np.isnan(all_actions_true) | 
+        np.isnan(all_actions_pred) |
+        np.isnan(all_rewards) |
+        np.isnan(all_glucose)
+    )
+    
+    # Calculate invalid count safely
+    invalid_count = len(valid_mask) - np.sum(valid_mask)
+    if invalid_count > 0:
+        print(f"Warning: Filtering {invalid_count} invalid samples with NaN values")
+        
+    # Apply mask to all arrays
+    all_actions_true = all_actions_true[valid_mask]
+    all_actions_pred = all_actions_pred[valid_mask]
+    all_rewards = all_rewards[valid_mask]
+    all_glucose = all_glucose[valid_mask]
+    all_states = all_states[valid_mask]
         
     # Add sanity check
     if len(all_actions_true) == 0:
