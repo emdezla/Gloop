@@ -181,40 +181,43 @@ class SACAgent(nn.Module):
         self.q2_target.load_state_dict(self.q2.state_dict())
         
         # Entropy regularization
-        self.target_entropy = -torch.prod(torch.Tensor([1])).item() * 2  # Increased exploration
+        self.target_entropy = -torch.prod(torch.Tensor([1])).item() * 1.5  # Reduced from 2 to 1.5
         self.log_alpha = torch.tensor([1.0], requires_grad=True)  # Start with higher entropy
         
         # Separate optimizers for actor and critic with adjusted learning rates
-        self.actor_optim = optim.Adam(self.actor.parameters(), lr=1e-5)  # Reduced from 3e-5
+        self.actor_optim = optim.Adam(self.actor.parameters(), lr=5e-6)  # Reduced from 1e-5
         self.critic_optim = optim.Adam(
-            list(self.q1.parameters()) + list(self.q2.parameters()), lr=1e-4)  # Increased from 3e-5
-        self.alpha_optim = optim.Adam([self.log_alpha], lr=3e-5)  # Reduced from 1e-4
+            list(self.q1.parameters()) + list(self.q2.parameters()), lr=2e-4)  # Increased from 1e-4
+        self.alpha_optim = optim.Adam([self.log_alpha], lr=1e-5)  # Reduced from 3e-5
 
     def _create_q_network(self, state_dim, action_dim):
-        """Create more stable Q-network with gradient protections"""
+        """Create more robust Q-network"""
         net = nn.Sequential(
-            nn.Linear(state_dim + action_dim, 128),
-            nn.LayerNorm(128),  # Add layer normalization
-            nn.Dropout(0.1),  # Add dropout for regularization
-            nn.LeakyReLU(0.01),  # Safer than ReLU
-            nn.Linear(128, 128),
-            nn.LayerNorm(128),
-            nn.Dropout(0.1),  # Add dropout for regularization
+            nn.Linear(state_dim + action_dim, 256),  # Increased from 128
+            nn.LayerNorm(256),
+            nn.Dropout(0.2),  # Increased dropout
             nn.LeakyReLU(0.01),
-            nn.Linear(128, 1)
+            nn.Linear(256, 256),  # Additional layer
+            nn.LayerNorm(256),
+            nn.Dropout(0.2),
+            nn.LeakyReLU(0.01),
+            nn.Linear(256, 1)
         )
         # Safer initialization
         for layer in net:
             if isinstance(layer, nn.Linear):
                 nn.init.xavier_uniform_(layer.weight, gain=nn.init.calculate_gain('leaky_relu', 0.01))
                 nn.init.constant_(layer.bias, 0)
+        
+        # Initialize final layer to smaller values
+        nn.init.uniform_(net[-1].weight, -3e-3, 3e-3)
         return net
 
     def act(self, state):
         """Direct tanh output without scaling"""
         return torch.tanh(self.actor(state))
 
-    def update_targets(self, tau=0.01):  # Changed from 0.05 to 0.01
+    def update_targets(self, tau=0.005):  # Reduced from 0.01 to 0.005
         """Soft target network updates"""
         with torch.no_grad():
             for target, source in zip(self.q1_target.parameters(), self.q1.parameters()):
@@ -244,6 +247,26 @@ class ReplayBuffer:
 # Training Core
 # --------------------------
 
+class EarlyStopping:
+    """Stop training when critic loss hasn't improved for given patience"""
+    def __init__(self, patience=50, min_delta=0.001):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_loss = float('inf')
+        self.counter = 0
+        self.epochs_since_improvement = 0
+
+    def __call__(self, current_loss):
+        if current_loss < (self.best_loss - self.min_delta):
+            self.best_loss = current_loss
+            self.counter = 0
+            self.epochs_since_improvement = 0
+            return False
+        else:
+            self.counter += 1
+            self.epochs_since_improvement += 1
+            return self.epochs_since_improvement >= self.patience
+
 def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', lr_warmup_epochs=50):
     """Simplified training loop for SAC
     
@@ -268,10 +291,13 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', lr_w
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     agent = SACAgent().to(device)
     
+    # Initialize early stopping
+    early_stopping = EarlyStopping(patience=50, min_delta=0.0001)
+    
     # Store initial learning rates for warmup
-    initial_actor_lr = 1e-5
-    initial_critic_lr = 1e-4
-    initial_alpha_lr = 3e-5
+    initial_actor_lr = 5e-6
+    initial_critic_lr = 2e-4
+    initial_alpha_lr = 1e-5
     
     # Add logging setup
     log_dir = Path("training_logs") / timestamp
@@ -297,6 +323,12 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', lr_w
             epoch_entropy = 0.0
             epoch_grad_norm = 0.0
             
+            # Check for early stopping
+            if epoch >= 100:  # Only start checking after 100 epochs
+                if early_stopping(epoch_critic_loss):
+                    print(f"\nEarly stopping at epoch {epoch} - No critic loss improvement for 50 epochs")
+                    break
+                    
             # Learning rate warmup
             if epoch < lr_warmup_epochs:
                 warmup_factor = (epoch + 1) / lr_warmup_epochs
@@ -350,7 +382,7 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', lr_w
                 epoch_q2_value += current_q2_mean
                 
                 # Scale rewards for more stable learning
-                scaled_rewards = rewards / 5.0  # Scale down rewards
+                scaled_rewards = rewards / 10.0  # Changed from 5.0 to 10.0
                 
                 agent.critic_optim.zero_grad()
                 critic_loss.backward()
@@ -403,7 +435,7 @@ def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', lr_w
                 agent.alpha_optim.step()
                 
                 # Update target networks less frequently to stabilize learning
-                if epoch % 2 == 0:  # Update targets every 2 epochs
+                if epoch % 5 == 0:  # Changed from every 2 epochs to every 5
                     agent.update_targets()
                 
                 # Track losses
