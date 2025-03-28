@@ -31,11 +31,21 @@ class DiabetesTestDataset(DiabetesDataset):
         super().__init__(csv_file)
         # Store raw glucose values for evaluation
         df = pd.read_csv(csv_file)
-        self.glucose_raw = df["glu_raw"].values.astype(np.float32)
         
-        # Store additional data for advanced analysis
+        # Add comprehensive NaN handling
+        if df["action"].isna().any():
+            print("Warning: NaN actions detected - filling with 0")
+            df["action"] = df["action"].fillna(0)
+            
+        # Validate and clean action values
+        self.actions = np.clip(df["action"].values.astype(np.float32), -1, 1)
+        
+        # Add full data validation
+        self.glucose_raw = self._validate_glucose(df["glu_raw"].values)
+        
+        # Store additional data with NaN handling
         self.timestamps = df["timestamp"].values if "timestamp" in df.columns else np.arange(len(self.glucose_raw))
-        self.meal_data = df["meal"].values.astype(np.float32) if "meal" in df.columns else None
+        self.meal_data = df["meal"].fillna(0).values.astype(np.float32) if "meal" in df.columns else None
         self.patient_id = os.path.basename(csv_file).split('-')[0] if '-' in os.path.basename(csv_file) else "unknown"
         
         # Add action range validation
@@ -47,6 +57,13 @@ class DiabetesTestDataset(DiabetesDataset):
         
         # Calculate glycemic variability metrics
         self.glycemic_metrics = self._calculate_glycemic_variability(self.glucose_raw)
+        
+    def _validate_glucose(self, values):
+        """Ensure valid glucose values with NaN handling"""
+        cleaned = pd.Series(values).fillna(method='ffill').fillna(method='bfill').values
+        if np.isnan(cleaned).any():
+            raise ValueError("Could not resolve all NaN values in glucose data")
+        return cleaned.astype(np.float32)
         
     def _calculate_time_in_range(self, glucose_values):
         """Calculate time in range metrics
@@ -273,6 +290,20 @@ def evaluate_model(model, test_dataset, model_metadata=None, output_dir="logs/ev
     all_actions_pred = np.array(all_actions_pred)
     all_rewards = np.array(all_rewards)
     all_glucose = np.array(all_glucose)
+    
+    # Add NaN validation and masking
+    valid_mask = ~(np.isnan(all_actions_true) | np.isnan(all_actions_pred))
+    if not np.all(valid_mask):
+        print(f"Warning: Filtering {len(valid_mask)-np.sum(valid_mask)} invalid samples with NaN values")
+        all_actions_true = all_actions_true[valid_mask]
+        all_actions_pred = all_actions_pred[valid_mask]
+        all_rewards = all_rewards[valid_mask]
+        all_glucose = all_glucose[valid_mask]
+        all_states = all_states[valid_mask]
+        
+    # Add sanity check
+    if len(all_actions_true) == 0:
+        raise ValueError("No valid samples remaining after NaN filtering")
     
     # Save raw predictions for further analysis
     np.savez(
