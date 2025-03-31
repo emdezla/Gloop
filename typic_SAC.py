@@ -203,268 +203,90 @@ class ReplayBuffer:
         return [self.buffer[i] for i in indices]
 
 # --------------------------
-# Training Loop
+# Simplified Training Loop
 # --------------------------
-def train_sac(dataset_path, epochs=500, batch_size=512, save_path='models', lr_warmup_epochs=50,
-              use_cql=False, cql_alpha=1.0):
-    """
-    Simplified training loop for SAC.
-    
-    Args:
-        dataset_path (str): Path to the CSV training dataset.
-        epochs (int): Number of training epochs.
-        batch_size (int): Batch size for each training step.
-        save_path (str): Directory to save model checkpoints.
-        lr_warmup_epochs (int): Number of epochs for learning rate warmup.
-        use_cql (bool): Whether to include the Conservative Q-Learning penalty.
-        cql_alpha (float): Weight for the CQL penalty.
-    
-    Returns:
-        SACAgent: The trained SAC agent.
-    """
-    
-    # Setup timestamp and model saving directory
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_path = os.path.join(save_path, timestamp)
-    
-    # Load dataset and create DataLoader
+def train_sac(dataset_path, epochs=10, batch_size=512):
+    # Simple dataset setup
     dataset = DiabetesDataset(dataset_path)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     
-    # Instantiate agent and move it to the chosen device
+    # Initialize agent
     agent = SACAgent().to(device)
     
-    # Compute normalization statistics (vectorized)
-    all_states = dataset.states  # (N, 8)
-    dataset_mean = torch.FloatTensor(all_states.mean(axis=0)).to(device)
-    dataset_std = torch.FloatTensor(all_states.std(axis=0)).to(device)
-    dataset_std[dataset_std < 1e-4] = 1.0  # Prevent division by nearly zero
-    
-    # Final learning rates for warmup (these match those in SACAgent)
-    final_actor_lr = FINAL_ACTOR_LR
-    final_critic_lr = FINAL_CRITIC_LR
-    final_alpha_lr = FINAL_ALPHA_LR
-    
-    # Setup logging for training metrics
-    log_dir = Path("training_logs") / timestamp
-    log_dir.mkdir(exist_ok=True, parents=True)
-    log_path = log_dir / "training_log.csv"
-    with open(log_path, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['epoch', 'critic_loss', 'actor_loss', 'alpha_loss',
-                         'q1_value', 'q2_value', 'action_mean', 'action_std',
-                         'entropy', 'grad_norm'])
-    
     # Main training loop
-    with tqdm(range(epochs), desc="Training") as pbar:
-        for epoch in pbar:
-            epoch_critic_loss = 0.0
-            epoch_actor_loss = 0.0
-            epoch_q1_value = 0.0
-            epoch_q2_value = 0.0
-            epoch_action_mean = 0.0
-            epoch_action_std = 0.0
-            epoch_entropy = 0.0
-            epoch_grad_norm = 0.0
+    for epoch in range(epochs):
+        print(f"\n=== Epoch {epoch+1}/{epochs} ===")
+        
+        for batch_idx, batch in enumerate(dataloader):
+            # Print sample data for debugging
+            state_sample = batch['state'][0].cpu().numpy()
+            action_sample = batch['action'][0].item()
+            reward_sample = batch['reward'][0].item()
+            next_state_sample = batch['next_state'][0].cpu().numpy()
             
-            # Warmup: Linearly increase learning rates over initial epochs
-            if epoch < lr_warmup_epochs:
-                warmup_factor = (epoch + 1) / lr_warmup_epochs
-                for param_group in agent.actor_optim.param_groups:
-                    param_group['lr'] = final_actor_lr * warmup_factor
-                for param_group in agent.critic_optim.param_groups:
-                    param_group['lr'] = final_critic_lr * warmup_factor
-                for param_group in agent.alpha_optim.param_groups:
-                    param_group['lr'] = final_alpha_lr * warmup_factor
+            print(f"Batch {batch_idx+1}:")
+            print(f"State: {state_sample.round(2)}")
+            print(f"Action: {action_sample:.3f}")
+            print(f"Reward: {reward_sample:.3f}")
+            print(f"Next State: {next_state_sample.round(2)}\n")
+
+            # Move data to device
+            states = batch['state'].to(device)
+            actions = batch['action'].to(device)
+            rewards = batch['reward'].to(device)
+            next_states = batch['next_state'].to(device)
+            dones = batch['done'].to(device)
+
+            # Critic Update
+            with torch.no_grad():
+                next_actions = agent.act(next_states)
+                q_next = torch.min(
+                    agent.q1_target(torch.cat([next_states, next_actions], 1)),
+                    agent.q2_target(torch.cat([next_states, next_actions], 1))
+                )
+                target_q = rewards + 0.99 * (1 - dones) * q_next
+
+            current_q1 = agent.q1(torch.cat([states, actions], 1))
+            current_q2 = agent.q2(torch.cat([states, actions], 1))
             
-            for batch in dataloader:
-                # Load batch data to device
-                states = batch['state'].to(device)
-                actions = batch['action'].to(device)
-                rewards = batch['reward'].to(device)
-                next_states = batch['next_state'].to(device)
-                dones = batch['done'].to(device)
-                
-                # Normalize states and next states
-                states = (states - dataset_mean) / (dataset_std + 1e-8)
-                next_states = (next_states - dataset_mean) / (dataset_std + 1e-8)
-                
-                # ---------------------
-                # Critic Update
-                # ---------------------
-                with torch.no_grad():
-                    next_actions = agent.act(next_states)
-                    q1_next = agent.q1_target(torch.cat([next_states, next_actions], dim=1))
-                    q2_next = agent.q2_target(torch.cat([next_states, next_actions], dim=1))
-                    q_next = torch.min(q1_next, q2_next)
-                    target_q = rewards + 0.99 * (1 - dones) * q_next
-                    target_q = torch.clamp(target_q, -10.0, 10.0)
-                
-                current_q1 = agent.q1(torch.cat([states, actions], dim=1))
-                current_q2 = agent.q2(torch.cat([states, actions], dim=1))
-                
-                q1_loss = F.mse_loss(current_q1, target_q)
-                q2_loss = F.mse_loss(current_q2, target_q)
-                critic_loss = q1_loss + q2_loss
-                
-                # Optional CQL penalty
-                if use_cql:
-                    random_actions = 2.0 * torch.rand_like(actions) - 1.0
-                    q1_rand = agent.q1(torch.cat([states, random_actions.detach()], dim=1))
-                    q2_rand = agent.q2(torch.cat([states, random_actions.detach()], dim=1))
-                    cql_term = (torch.logsumexp(q1_rand, dim=0).mean() +
-                                torch.logsumexp(q2_rand, dim=0).mean()) - torch.min(current_q1, current_q2).mean()
-                    critic_loss += cql_alpha * cql_term
-                
-                # Apply gradient penalty to both Q-networks
-                grad_penalty = 0.0
-                for q_net in [agent.q1, agent.q2]:
-                    states.requires_grad_(True)
-                    q_val = q_net(torch.cat([states, actions.detach()], dim=1))
-                    grad = torch.autograd.grad(outputs=q_val.mean(), inputs=states, create_graph=True)[0]
-                    grad_penalty += grad.pow(2).mean()
-                    states.requires_grad_(False)
-                grad_penalty /= 2.0
-                critic_loss += 0.5 * grad_penalty
-                
-                # Record Q-values for logging
-                epoch_q1_value += current_q1.mean().item()
-                epoch_q2_value += current_q2.mean().item()
-                
-                agent.critic_optim.zero_grad()
-                critic_loss.backward()
-                torch.nn.utils.clip_grad_norm_(list(agent.q1.parameters()) + list(agent.q2.parameters()), 1.0)
-                agent.critic_optim.step()
-                
-                # ---------------------
-                # Actor Update
-                # ---------------------
-                pred_actions = agent.act(states)
-                q1_pred = agent.q1(torch.cat([states, pred_actions], dim=1))
-                q2_pred = agent.q2(torch.cat([states, pred_actions], dim=1))
-                actor_loss = -(torch.min(q1_pred, q2_pred)).mean()
-                
-                # L2 regularization for actor weights
-                l2_reg = 0.0005
-                for param in agent.actor.parameters():
-                    actor_loss += l2_reg * torch.sum(param.pow(2))
-                
-                # Log action statistics
-                with torch.no_grad():
-                    epoch_action_mean += pred_actions.mean().item()
-                    epoch_action_std += pred_actions.std().item()
-                    epoch_entropy += agent.log_alpha.exp().item()
-                
-                agent.actor_optim.zero_grad()
-                actor_loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(agent.actor.parameters(), 1.0).item()
-                epoch_grad_norm += grad_norm
-                agent.actor_optim.step()
-                
-                # ---------------------
-                # Temperature (Alpha) Update
-                # ---------------------
-                # Note: This alpha update is a simplified version and does not follow the full SAC formulation.
-                alpha_loss = -(agent.log_alpha * (agent.target_entropy + 0.5)).mean()
-                agent.alpha_optim.zero_grad()
-                alpha_loss.backward()
-                agent.alpha_optim.step()
-                
-                # Update target networks every few epochs for stability
-                if epoch % 5 == 0:
-                    agent.update_targets()
-                
-                epoch_critic_loss += critic_loss.item()
-                epoch_actor_loss += actor_loss.item()
-                epoch_alpha_loss += alpha_loss.item()
+            critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
             
-            # Average metrics over batches
-            num_batches = len(dataloader)
-            epoch_critic_loss /= num_batches
-            epoch_actor_loss /= num_batches
-            epoch_q1_value /= num_batches
-            epoch_q2_value /= num_batches
-            epoch_action_mean /= num_batches
-            epoch_action_std /= num_batches
-            epoch_entropy /= num_batches
-            epoch_grad_norm /= num_batches
-            epoch_alpha_loss /= num_batches
+            agent.critic_optim.zero_grad()
+            critic_loss.backward()
+            agent.critic_optim.step()
+
+            # Actor Update
+            pred_actions = agent.act(states)
+            actor_loss = -torch.min(
+                agent.q1(torch.cat([states, pred_actions], 1)),
+                agent.q2(torch.cat([states, pred_actions], 1))
+            ).mean()
             
-            pbar.set_postfix({
-                'Critic': f"{epoch_critic_loss:.3f}",
-                'Actor': f"{epoch_actor_loss:.3f}",
-                'Q1': f"{epoch_q1_value:.3f}",
-                'Q2': f"{epoch_q2_value:.3f}",
-                'α': f"{epoch_entropy:.3f}",
-                '∇': f"{epoch_grad_norm:.2f}"
-            })
-            
-            # Log metrics to CSV
-            with open(log_path, 'a', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow([epoch, epoch_critic_loss, epoch_actor_loss, epoch_alpha_loss,
-                                 epoch_q1_value, epoch_q2_value, epoch_action_mean, epoch_action_std,
-                                 epoch_entropy, epoch_grad_norm])
-            
-            # Save a checkpoint every 50 epochs
-            if (epoch + 1) % 50 == 0:
-                Path(save_path).mkdir(parents=True, exist_ok=True)
-                checkpoint_path = os.path.join(save_path, f"sac_checkpoint_epoch{epoch+1}_{timestamp}.pth")
-                torch.save(agent.state_dict(), checkpoint_path)
-                print(f"Checkpoint saved to {checkpoint_path}")
-    
-    # Save final model
-    Path(save_path).mkdir(parents=True, exist_ok=True)
-    final_model_path = os.path.join(save_path, f"sac_final_model_{timestamp}.pth")
-    torch.save(agent.state_dict(), final_model_path)
-    print(f"Training complete. Model saved to {final_model_path}")
+            agent.actor_optim.zero_grad()
+            actor_loss.backward()
+            agent.actor_optim.step()
+
+            # Temperature Update
+            alpha_loss = -(agent.log_alpha * (agent.target_entropy + 0.5)).mean()
+            agent.alpha_optim.zero_grad()
+            alpha_loss.backward()
+            agent.alpha_optim.step()
+
+            # Update targets
+            agent.update_targets()
+
+        print(f"Critic Loss: {critic_loss.item():.4f}")
+        print(f"Actor Loss: {actor_loss.item():.4f}")
+        print(f"Alpha Loss: {alpha_loss.item():.4f}")
+
     return agent
 
 
 if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='Train SAC agent for diabetes management')
-    parser.add_argument('--dataset', type=str, default="datasets/processed/full-training.csv", 
-                        help='Path to the training dataset')
-    parser.add_argument('--epochs', type=int, default=500, 
-                        help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=512,
-                        help='Batch size for training')
-    parser.add_argument('--save_path', type=str, default="models", 
-                        help='Directory to save the trained model')
-    parser.add_argument('--lr_warmup', type=int, default=50,
-                        help='Number of epochs for learning rate warmup')
-    parser.add_argument('--use_cql', action='store_true',
-                        help='Enable Conservative Q-Learning penalty')
-    parser.add_argument('--cql_alpha', type=float, default=1.0,
-                        help='Weight for CQL penalty term')
-    
-    args = parser.parse_args()
-    
+    # Simple execution
     print(f"Training on device: {device}")
-
-    # Train the agent
     agent = train_sac(
-        dataset_path=args.dataset,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        save_path=args.save_path,
-        lr_warmup_epochs=args.lr_warmup,
-        use_cql=args.use_cql,
-        cql_alpha=args.cql_alpha
+        dataset_path="datasets/processed/559-train.csv",
+        epochs=10,
+        batch_size=512
     )
-
-    # Get the timestamp from the most recent directory in training_logs
-    training_logs_dir = Path("training_analysis")
-    if training_logs_dir.exists():
-        # Find the most recent timestamp directory
-        timestamp_dirs = [d for d in training_logs_dir.iterdir() if d.is_dir()]
-        if timestamp_dirs:
-            latest_dir = max(timestamp_dirs, key=lambda x: x.stat().st_mtime)
-            # Run analysis on training logs
-            analyze_training_log(log_path=latest_dir / "training_log.csv")
-        else:
-            print("No training logs found to analyze")
-    else:
-        print("Training logs directory not found")
