@@ -35,6 +35,8 @@ class DiabetesDataset(Dataset):
     def __init__(self, csv_file):
         df = pd.read_csv(csv_file)
         
+        df = df.ffill().bfill()
+        
         # Add explicit glu_raw validation
         if df["glu_raw"].isna().any():
             print("NaN values in glu_raw - filling with forward/backward fill")
@@ -49,7 +51,7 @@ class DiabetesDataset(Dataset):
             print(f"Min: {np.nanmin(glu_raw)}, Max: {np.nanmax(glu_raw)}")
             
         # Handle missing values by forward-filling and backward-filling
-        df = df.ffill().bfill()
+        
         
         # Verify no remaining NaNs
         if df[["glu", "glu_d", "glu_t", "hr", "hr_d", "hr_t", "iob", "hour"]].isna().any().any():
@@ -660,9 +662,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(torch.cuda.is_available())
     print(f"Training on device: {device}")
-    print(torch.cuda.FloatTensor())
+
     # Train the agent
     agent = train_sac(
         dataset_path=args.dataset,
@@ -673,7 +674,7 @@ if __name__ == "__main__":
         use_cql=args.use_cql,
         cql_alpha=args.cql_alpha
     )
-    
+
     # Get the timestamp from the most recent directory in training_logs
     training_logs_dir = Path("training_logs")
     if training_logs_dir.exists():
