@@ -37,21 +37,6 @@ class DiabetesDataset(Dataset):
         
         df = df.ffill().bfill()
         
-        # Add explicit glu_raw validation
-        if df["glu_raw"].isna().any():
-            print("NaN values in glu_raw - filling with forward/backward fill")
-            df["glu_raw"] = df["glu_raw"].ffill().bfill()
-            if df["glu_raw"].isna().any():
-                raise ValueError("glu_raw contains NaNs that couldn't be filled")
-
-        # Add bounds check for glu_raw
-        glu_raw = df["glu_raw"].values
-        if np.any(glu_raw < 40) or np.any(glu_raw > 400):
-            print("Warning: glu_raw contains values outside clinical range 40-400 mg/dL")
-            print(f"Min: {np.nanmin(glu_raw)}, Max: {np.nanmax(glu_raw)}")
-            
-        # Handle missing values by forward-filling and backward-filling
-        
         
         # Verify no remaining NaNs
         if df[["glu", "glu_d", "glu_t", "hr", "hr_d", "hr_t", "iob", "hour"]].isna().any().any():
@@ -85,18 +70,10 @@ class DiabetesDataset(Dataset):
         dev_penalty = ((glucose - target) ** 2) / (target ** 2)  # Normalized
         
         # Hypoglycemia penalty (starts below 70)
-        hypo_penalty = np.where(
-            glucose < 70,
-            (70 - glucose) * 0.03,  # Gentle linear slope
-            0.0
-        )
+        hypo_penalty = np.where( glucose < 70, (70 - glucose) * 0.03,  0.0)
         
         # Hyperglycemia penalty (starts above 180)
-        hyper_penalty = np.where(
-            glucose > 180,
-            (glucose - 180) * 0.02,  # Milder slope for hyper
-            0.0
-        )
+        hyper_penalty = np.where(glucose > 180, (glucose - 180) * 0.02,  0.0)
         
         # Combined reward with Q-value scaling control
         rewards = -(dev_penalty + hypo_penalty + hyper_penalty) * 0.5  # Critical scaling factor

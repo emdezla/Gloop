@@ -147,7 +147,7 @@ def choose_value(row, meas_col):
         else:
             return np.nan
 
-def compute_iob(df, DOA_hours=5, interval_min=5):
+def compute_iob(df, DOA_hours=3, interval_min=5):
     """
     Compute the Insulin On Board (IOB) for each row of the DataFrame.
     

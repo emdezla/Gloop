@@ -36,16 +36,36 @@ class DiabetesDataset(Dataset):
         self._sanitize_transitions()
 
     def _compute_rewards(self, glucose_next):
-        """Improved reward scaling"""
-        glucose_next = np.clip(glucose_next, 40, 400)
-        with np.errstate(invalid='ignore'):
-            log_term = np.log(glucose_next/180.0)
-            risk_index = 10 * (1.509 * (log_term**1.084 - 1.861)**2)
-        
-        # Better reward scaling using sigmoid instead of tanh
-        rewards = -1 / (1 + np.exp(-risk_index/50))  # Scaled to (-1, 0)
-        rewards[glucose_next < 54] = -5.0  # Stronger hypo penalty
-        return rewards.astype(np.float32)
+        """
+        Compute rewards using a rescaled Risk Index (RI)-based function.
+        Based on Kovatchev et al. (2005), extended with a severe hypoglycemia penalty.
+        """
+        glucose = np.clip(glucose_next.astype(np.float32), 10, 400)  # Clamp extreme values
+
+        # Step 1: Risk transformation function
+        log_glucose = np.log(glucose)
+        f = 1.509 * (np.power(log_glucose, 1.084) - 5.381)
+        r = 10 * np.square(f)
+
+        # Step 2: LBGI and HBGI
+        lbgi = np.where(f < 0, r, 0)
+        hbgi = np.where(f > 0, r, 0)
+
+        # Step 3: Total Risk Index (RI)
+        ri = lbgi + hbgi
+
+        # Step 4: Rescale RI and convert to reward
+        normalized_ri = -ri / 10.0  # Stronger signal than /100
+        rewards = np.clip(normalized_ri, -5.0, 0.0)
+
+        # Step 5: Severe hypoglycemia penalty
+        severe_hypo_penalty = np.where(glucose <= 39, -15.0, 0.0)
+        rewards += severe_hypo_penalty
+
+        # Step 6: Optional time penalty
+        rewards -= 0.01  # Encourage faster correction
+
+        return np.clip(rewards, -15.0, 0.0).astype(np.float32)
 
     def _sanitize_transitions(self):
         """Remove invalid transitions and align array lengths"""

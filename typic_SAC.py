@@ -205,7 +205,7 @@ class ReplayBuffer:
 # --------------------------
 # Simplified Training Loop
 # --------------------------
-def train_sac(dataset_path, epochs=10, batch_size=512):
+def train_sac(dataset_path, epochs=100, batch_size=512):
     # Simple dataset setup
     dataset = DiabetesDataset(dataset_path)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -219,16 +219,16 @@ def train_sac(dataset_path, epochs=10, batch_size=512):
         
         for batch_idx, batch in enumerate(dataloader):
             # Print sample data for debugging
-            state_sample = batch['state'][0].cpu().numpy()
-            action_sample = batch['action'][0].item()
-            reward_sample = batch['reward'][0].item()
-            next_state_sample = batch['next_state'][0].cpu().numpy()
+            #state_sample = batch['state'][0].cpu().numpy()
+            #action_sample = batch['action'][0].item()
+            #reward_sample = batch['reward'][0].item()
+            #next_state_sample = batch['next_state'][0].cpu().numpy()
             
-            print(f"Batch {batch_idx+1}:")
-            print(f"State: {state_sample.round(2)}")
-            print(f"Action: {action_sample:.3f}")
-            print(f"Reward: {reward_sample:.3f}")
-            print(f"Next State: {next_state_sample.round(2)}\n")
+            #print(f"Batch {batch_idx+1}:")
+            #print(f"State: {state_sample.round(2)}")
+            #print(f"Action: {action_sample:.3f}")
+            #print(f"Reward: {reward_sample:.3f}")
+            #print(f"Next State: {next_state_sample.round(2)}\n")
 
             # Move data to device
             states = batch['state'].to(device)
