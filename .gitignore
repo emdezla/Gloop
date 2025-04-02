@@ -1,8 +1,10 @@
 # Virtual environment
 venv*/
 venv_tensorboard/
+.venv/
 
 # Large files
 *.dll
 *.pyd
 /llm/dataset/img_data
+llm/dataset/data.csv
