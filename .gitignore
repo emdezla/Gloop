@@ -2,6 +2,8 @@
 venv*/
 venv_tensorboard/
 .venv/
+env*/
+.env/
 
 # Large files
 *.dll
