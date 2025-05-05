@@ -14,3 +14,4 @@ llm/dataset/data.csv
 # Other
 __pycache__/
 *.pyc
+scaler.pkl
