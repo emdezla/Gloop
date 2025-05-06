@@ -10,6 +10,7 @@ env*/
 *.pyd
 /llm/dataset/img_data
 llm/dataset/data.csv
+llm/dataset/data_clean.csv
 
 # Other
 __pycache__/
