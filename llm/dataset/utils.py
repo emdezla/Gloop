@@ -15,13 +15,13 @@ def generate_imgs_for_training(data, index, indent=50, pid="", dirname="img_data
     current_time = patch.iloc[-1]['time']
     patch['time_since'] = (patch['time'] - current_time).dt.total_seconds() / 60
     
-    # Plot the data with the specified figure size
+    # Plot the data with the specified figure size ## double check correct values
     for metric, ylabel, filename in [
-        ('glu_raw', 'Glucose Raw', 'glu'),  # glucose
-        ('hr', 'Heart Rate Raw', 'hr'),     # heart rate
-        ('iob', 'Insulin On Body', 'iob'),  # insulin on body
-        ('basal', 'Basal', 'basal'),        # basal
-        ('bolus', 'Bolus', 'bolus')         # bolus
+        ('glu_raw', 'Glucose (mg/dL)', 'glu'),         # glucose
+        ('hr_raw', 'Heart Rate (BPM)', 'hr'),          # heart rate
+        ('iob_raw', 'Insulin On Body (unit)', 'iob'),  # insulin on body
+        ('basal_raw', 'Basal (unit/hour)', 'basal'),   # basal
+        ('bolus_raw', 'Bolus (unit)', 'bolus')         # bolus
         ]:
 
         # Create the plot
