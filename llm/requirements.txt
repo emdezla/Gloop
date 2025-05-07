@@ -19,3 +19,4 @@ numpy
 matplotlib
 tqdm
 pillow
+scikit-learn
