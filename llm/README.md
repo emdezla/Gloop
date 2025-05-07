@@ -8,6 +8,8 @@ Set up hugging face
 ```
 export HF_TOKEN="hf_…your_token…"
 huggingface-cli login --token $HF_TOKEN --add-to-git-credential
+
+export WANDB_API_KEY="...your key"
 ```
 
 ## Training
