@@ -1,39 +1,30 @@
-# Gloop
-Expanding the glucose-insulin loop of artificial pancreas systems
+# Gloop: Glucose-Insulin Loop Reinforcement Learning
+Expanding the glucose-insulin loop of artificial pancreas systems using SAC-CQL
 
-(Project repository created for the MIT course "How to AI almost anything" (MAS.S60))
+## 📁 Dataset Characteristics
 
+### OhioT1DM Processed Data
+**State Space (8 dimensions):**
+- `glu`: Normalized glucose level (40-400 mg/dL → [-1,1])
+- `glu_d`: Rate of change (mg/dL/min, normalized)
+- `glu_t`: 30-min trend slope (normalized)
+- `hr`: Heart rate (normalized per patient)
+- `hr_d`: HR change rate (bpm/min, normalized)
+- `hr_t`: 30-min HR trend slope
+- `iob`: Insulin on Board (0-5U, normalized)
+- `hour`: Time of day (0-1 scaled from 0-24h)
 
-## 📁 Dataset: OhioT1DM
+**Action Space (Continuous):**  
+Single action value ∈ [-1,1] mapping to insulin pump rate:
+- -1: Minimum insulin (0 U/hr)
+- 1: Maximum insulin (5 U/hr)
+- Nonlinear transformation via `tia_action()` function
 
-The dataset OhioT1DM is processed to obtain csv files with the following structure:
+**Key Features:**
+- 5-minute resolution temporal data
+- Patient-specific normalization scalers
+- Episode boundaries at day transitions
+- 6 patient datasets with train/test splits
 
----
+## 🏗️ Code Structure
 
-| Column       | Description                                                                 |
-|--------------|-----------------------------------------------------------------------------|
-| `time`       | Timestamp of the measurement (5-minute intervals).                          |
-| **STATE**    |                                                                             |
-| `glu`        | Glucose level (normalized).                                                 |
-| `glu_d`      | Glucose derivative (change from previous value, normalized).                |
-| `glu_t`      | Glucose trend (slope over past 30 minutes, normalized).                     |
-| `hr`         | Heart rate (normalized).                                                    |
-| `hr_d`       | Heart rate derivative (change from previous value, normalized).             |
-| `hr_t`       | Heart rate trend (slope over past 30 minutes, normalized).                  |
-| `iob`        | Insulin on Board — active insulin in the body (normalized).                 |
-| `hour_norm`  | Time of day encoded as hour / 24 (e.g., 8:00 AM → 0.33).                    |
-| **ACTION**   |                                                                             |
-| `basal`      | Continuous background insulin rate (normalized).                            |
-| `bol`        | Discrete insulin bolus dose (normalized).                                   |
-| **OTHER**    |                                                                             |
-| `done`       | Episode boundary flag (1 = end of episode/day, 0 = otherwise).              |
-
----
-
-## 🧠 Intended Use (RL Environment)
-
-- **State vector** (shape: 8):  
-  `[glu, glu_d, glu_t, hr, hr_d, hr_t, iob, hour_norm]`
-
-- **Action vector** (shape: 2):  
-  `[basal, bol]`
