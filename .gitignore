@@ -31,6 +31,9 @@ logs/
 
 # Jupyter notebooks
 .ipynb_checkpoints/
+.venv/
+env*/
+.env/
 
 # Package files
 *.egg-info/
@@ -38,3 +41,12 @@ logs/
 build/
 dist/
 .aider*
+
+/llm/dataset/img_data
+llm/dataset/data.csv
+llm/dataset/data_clean.csv
+
+# Other
+__pycache__/
+*.pyc
+scaler.pkl
