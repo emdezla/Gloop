@@ -1,13 +1,47 @@
 # Virtual environment
-venv*/
-venv_tensorboard/
+venv/
+.env/
+.venv/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data files
+*.csv
+*.data
+*.dat
+*.pth
+
+# Logs and outputs
+*.log
+runs/
+logs/
+
+# Tensorboard
+*.tbevents.*
+
+# Jupyter notebooks
+.ipynb_checkpoints/
 .venv/
 env*/
 .env/
 
-# Large files
-*.dll
-*.pyd
+# Package files
+*.egg-info/
+*.egg
+build/
+dist/
+.aider*
+
 /llm/dataset/img_data
 llm/dataset/data.csv
 llm/dataset/data_clean.csv
